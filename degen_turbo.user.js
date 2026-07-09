@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.8.5
+// @version      1.8.7
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -20,8 +20,8 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.8.5";
-  const MIN_DELAY = 30; // limite site ~50 ms entre paris
+  const SCRIPT_VERSION = "1.8.7";
+  const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
   const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
   const KNOWN_SET = new Set(KNOWN_ASSETS);
@@ -36,7 +36,7 @@
     game: GM_getValue("dg_game", "dice"),
     asset: GM_getValue("dg_asset", ""),
     betAmount: GM_getValue("dg_bet", "0.0001"),
-    delayMs: parseInt(GM_getValue("dg_delay", String(MIN_DELAY)), 10) || MIN_DELAY,
+    delayMs: parseInt(GM_getValue("dg_delay", String(DEFAULT_DELAY)), 10) || DEFAULT_DELAY,
     maxBets: parseInt(GM_getValue("dg_max", "0"), 10) || 0,
     diceType: GM_getValue("dg_dice_type", "ROLL_OVER"),
     diceTarget: parseFloat(GM_getValue("dg_dice_target", "50")) || 50,
@@ -295,6 +295,16 @@
     return e?.network || (!e?.status && /failed to fetch|networkerror|load failed/i.test(e?.message || ""));
   }
 
+  function getRateLimitWaitMs(res) {
+    const retryAfter = parseInt(res.headers?.get?.("retry-after"), 10);
+    if (retryAfter > 0) return Math.min(retryAfter * 1000, 30000);
+    const reset = parseInt(res.headers?.get?.("x-ratelimit-reset"), 10);
+    // reset en ms (ex. 3004) ou secondes si petit entier
+    if (reset > 0 && reset < 120) return reset * 1000;
+    if (reset >= 120 && reset < 60000) return reset;
+    return 3000;
+  }
+
   async function api(path, body) {
     let res;
     try {
@@ -319,6 +329,7 @@
       err.status = res.status;
       err.data = data;
       err.path = path;
+      if (res.status === 429) err.rateLimitMs = getRateLimitWaitMs(res);
       throw err;
     }
     return data;
@@ -730,9 +741,7 @@
       return;
     }
 
-    const delay = cfg.game === "mines"
-      ? Math.max(200, cfg.delayMs)
-      : Math.max(MIN_DELAY, cfg.delayMs);
+    const delay = cfg.delayMs > 0 ? cfg.delayMs : DEFAULT_DELAY;
 
     try {
       while (!abort) {
@@ -752,8 +761,9 @@
             continue;
           }
           if (e.status === 429) {
-            setStatus("Rate limit — pause 2s");
-            await sleep(2000);
+            const wait = e.rateLimitMs || 3000;
+            setStatus(`Rate limit — pause ${Math.round(wait / 1000)}s`);
+            await sleep(wait);
             continue;
           }
           if (e.status === 403) {
@@ -802,7 +812,7 @@
   function readForm() {
     cfg.game = document.getElementById("dg-game").value;
     cfg.betAmount = formatBetAmount(document.getElementById("dg-bet").value);
-    cfg.delayMs = parseInt(document.getElementById("dg-delay").value, 10) || MIN_DELAY;
+    cfg.delayMs = Math.max(0, parseInt(document.getElementById("dg-delay").value, 10) || DEFAULT_DELAY);
     cfg.maxBets = parseInt(document.getElementById("dg-max").value, 10) || 0;
     cfg.diceType = document.getElementById("dg-dice-type").value;
     cfg.diceTarget = clampDiceTarget(document.getElementById("dg-dice-target").value);
@@ -1090,7 +1100,7 @@
         <div class="dg-row">
           <div>
             <label>Délai (ms)</label>
-            <input id="dg-delay" type="number" min="55" value="${cfg.delayMs}" />
+            <input id="dg-delay" type="number" min="0" value="${cfg.delayMs}" title="Délai entre paris (ms). &lt;55 = risque rate limit" />
           </div>
           <div>
             <label>Max paris (0=∞)</label>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.8.7
+// @version      1.9.0
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -20,8 +20,9 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.8.7";
+  const SCRIPT_VERSION = "1.9.0";
   const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
+  const KENO_LIMITS = { keno_40: 40, keno_50: 50, keno_60: 60, keno_70: 70, keno_80: 80 };
   const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
   const KNOWN_SET = new Set(KNOWN_ASSETS);
@@ -43,9 +44,11 @@
     limboMult: parseFloat(GM_getValue("dg_limbo_mult", "2")) || 2,
     plinkoRisk: GM_getValue("dg_plinko_risk", "LOW"),
     plinkoRows: parseInt(GM_getValue("dg_plinko_rows", "8"), 10) || 8,
-    kenoVariant: GM_getValue("dg_keno_variant", "keno_40"),
+    kenoVariant: normalizeKenoVariant(GM_getValue("dg_keno_variant", "keno_40")),
     kenoRisk: GM_getValue("dg_keno_risk", "CLASSIC"),
-    kenoNumbers: GM_getValue("dg_keno_numbers", "1,2,3,4"),
+    kenoNumbers: GM_getValue("dg_keno_numbers", ""),
+    kenoRandom: GM_getValue("dg_keno_random", "0") === "1",
+    kenoPickCount: parseInt(GM_getValue("dg_keno_pick_count", "4"), 10) || 4,
     minesCount: parseInt(GM_getValue("dg_mines_count", "3"), 10) || 3,
     minesReveals: parseInt(GM_getValue("dg_mines_reveals", "1"), 10) || 1,
     minesTiles: GM_getValue("dg_mines_tiles", ""),
@@ -56,6 +59,29 @@
     stopProfit: parseFloat(GM_getValue("dg_stop_profit", "0")) || 0,
     stopLoss: parseFloat(GM_getValue("dg_stop_loss", "0")) || 0
   };
+
+  function normalizeKenoVariant(v) {
+    const legacy = { keno_10: "keno_40", keno_20: "keno_50" };
+    const next = legacy[v] || v;
+    return KENO_LIMITS[next] ? next : "keno_40";
+  }
+
+  function validateKeno() {
+    const max = KENO_LIMITS[cfg.kenoVariant] || 40;
+    const manual = parseKenoNumbers();
+    const useRandom = cfg.kenoRandom || manual.length === 0;
+    if (useRandom) {
+      const count = cfg.kenoPickCount || 4;
+      if (count < 1 || count > max) return `Nb numéros aléatoires: entre 1 et ${max}`;
+      return null;
+    }
+    if (!manual.length) return "Aucun numéro Keno valide";
+    if (manual.length > max) return `Max ${max} numéros pour ${cfg.kenoVariant}`;
+    const invalid = manual.filter((n) => n < 1 || n > max);
+    if (invalid.length) return `Numéros hors plage 1-${max}`;
+    if (manual.length !== new Set(manual).size) return "Numéros en double";
+    return null;
+  }
 
   function setAsset(asset) {
     if (!asset) return;
@@ -208,6 +234,8 @@
     GM_setValue("dg_keno_variant", cfg.kenoVariant);
     GM_setValue("dg_keno_risk", cfg.kenoRisk);
     GM_setValue("dg_keno_numbers", cfg.kenoNumbers);
+    GM_setValue("dg_keno_random", cfg.kenoRandom ? "1" : "0");
+    GM_setValue("dg_keno_pick_count", String(cfg.kenoPickCount));
     GM_setValue("dg_mines_count", String(cfg.minesCount));
     GM_setValue("dg_mines_reveals", String(cfg.minesReveals));
     GM_setValue("dg_mines_tiles", cfg.minesTiles);
@@ -366,17 +394,36 @@
       .filter((n) => !isNaN(n) && n > 0);
   }
 
-  async function betKeno() {
-    const selectedNumbers = parseKenoNumbers();
-    if (selectedNumbers.length === 0) {
-      throw new Error("Aucun numéro Keno valide");
+  function pickRandomKenoNumbers(count, max) {
+    const pool = [];
+    for (let i = 1; i <= max; i++) pool.push(i);
+    const n = Math.min(Math.max(1, count), max);
+    const picked = [];
+    for (let i = 0; i < n; i++) {
+      const idx = Math.floor(Math.random() * pool.length);
+      picked.push(pool.splice(idx, 1)[0]);
     }
-    return api("/games/keno/bet", betBody({
+    return picked.sort((a, b) => a - b);
+  }
+
+  function getKenoSelectedNumbers() {
+    const max = KENO_LIMITS[cfg.kenoVariant] || 40;
+    const manual = parseKenoNumbers();
+    const useRandom = cfg.kenoRandom || manual.length === 0;
+    if (!useRandom) return manual;
+    return pickRandomKenoNumbers(cfg.kenoPickCount || 4, max);
+  }
+
+  async function betKeno() {
+    const selectedNumbers = getKenoSelectedNumbers();
+    const data = await api("/games/keno/bet", betBody({
       betAmount: cfg.betAmount,
       variantId: cfg.kenoVariant,
       riskLevel: cfg.kenoRisk,
       selectedNumbers
     }));
+    data.kenoDetail = selectedNumbers.join(",");
+    return data;
   }
 
   const MINES_GRID = 25;
@@ -550,7 +597,7 @@
   }
 
   function getBetDetail(data) {
-    return data.minesDetail ?? data.rollResult ?? data.resultMultiplier
+    return data.minesDetail ?? data.kenoDetail ?? data.rollResult ?? data.resultMultiplier
       ?? (data.matches != null ? `${data.matches} match ×${data.payoutMultiplier}` : null)
       ?? "—";
   }
@@ -703,10 +750,17 @@
   }
 
   function updateStats() {
-    const el = document.getElementById("dg-stats");
-    if (!el) return;
-    el.textContent =
-      `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)} ${cfg.asset || ""}`;
+    const counts = document.getElementById("dg-stats");
+    const pnl = document.getElementById("dg-stats-pnl");
+    if (counts) {
+      counts.textContent = `Paris: ${stats.bets} · W: ${stats.wins} · L: ${stats.losses}`;
+    }
+    if (pnl) {
+      const sign = stats.profit >= 0 ? "+" : "";
+      pnl.textContent = `${sign}${formatAmt(stats.profit)} ${cfg.asset || ""}`;
+      pnl.classList.toggle("dg-pnl-pos", stats.profit >= 0);
+      pnl.classList.toggle("dg-pnl-neg", stats.profit < 0);
+    }
   }
 
   async function waitForAsset(maxMs = 15000) {
@@ -728,6 +782,13 @@
     if (!assetConfirmed || !cfg.asset) {
       setStatus("Crypto introuvable — change de wallet sur Degen puis réessaie");
       return;
+    }
+    if (cfg.game === "keno") {
+      const kenoErr = validateKeno();
+      if (kenoErr) {
+        setStatus(kenoErr);
+        return;
+      }
     }
     running = true;
     abort = false;
@@ -819,9 +880,11 @@
     cfg.limboMult = clampLimboMult(document.getElementById("dg-limbo-mult").value);
     cfg.plinkoRisk = document.getElementById("dg-plinko-risk").value;
     cfg.plinkoRows = clampPlinkoRows(document.getElementById("dg-plinko-rows").value);
-    cfg.kenoVariant = document.getElementById("dg-keno-variant").value;
+    cfg.kenoVariant = normalizeKenoVariant(document.getElementById("dg-keno-variant").value);
     cfg.kenoRisk = document.getElementById("dg-keno-risk").value;
     cfg.kenoNumbers = document.getElementById("dg-keno-numbers").value.trim();
+    cfg.kenoRandom = !!document.getElementById("dg-keno-random")?.checked;
+    cfg.kenoPickCount = Math.max(1, parseInt(document.getElementById("dg-keno-pick-count")?.value, 10) || 4);
     cfg.minesCount = parseInt(document.getElementById("dg-mines-count").value, 10) || 3;
     cfg.minesReveals = parseInt(document.getElementById("dg-mines-reveals").value, 10) || 1;
     cfg.minesTiles = document.getElementById("dg-mines-tiles").value.trim();
@@ -920,9 +983,27 @@
     if (el) el.textContent = "⚡ Degen Turbo v" + SCRIPT_VERSION;
   }
 
+  function upgradeStatsLayout() {
+    if (document.getElementById("dg-stats-pnl")) return;
+    const row = document.querySelector("#degen-turbo-panel .dg-stats-row");
+    const old = document.getElementById("dg-stats");
+    if (!row || !old) return;
+    const block = document.createElement("div");
+    block.className = "dg-stats-block";
+    const pnl = document.createElement("div");
+    pnl.id = "dg-stats-pnl";
+    pnl.className = "dg-pnl-pos";
+    block.appendChild(old);
+    block.appendChild(pnl);
+    const histBtn = document.getElementById("dg-history-btn");
+    row.insertBefore(block, histBtn || null);
+    updateStats();
+  }
+
   function buildUI() {
     if (document.getElementById("degen-turbo-panel")) {
       updatePanelTitle();
+      upgradeStatsLayout();
       return;
     }
 
@@ -959,10 +1040,21 @@
       #dg-reset { background: #333; color: #ccc; flex: 0 0 auto; padding: 8px 10px; }
       #dg-cashout { background: #ca8a04; color: #000; flex: 0 0 auto; padding: 8px 10px; }
       #dg-status { margin-top: 8px; font-size: 11px; color: #888; min-height: 16px; }
-      #dg-stats { margin-top: 4px; font-size: 11px; color: #6ee7b7; flex: 1; }
-      #degen-turbo-panel .dg-stats-row {
-        display: flex; align-items: center; gap: 6px; margin-top: 4px;
+      #degen-turbo-panel .dg-stats-block {
+        margin-top: 8px; padding: 8px 10px; background: #0d0d10;
+        border: 1px solid #2a2a35; border-radius: 8px;
       }
+      #dg-stats { font-size: 11px; color: #888; margin-bottom: 4px; }
+      #dg-stats-pnl {
+        font-size: 20px; font-weight: 700; line-height: 1.2;
+        letter-spacing: 0.02em; font-variant-numeric: tabular-nums;
+      }
+      #dg-stats-pnl.dg-pnl-pos { color: #4ade80; }
+      #dg-stats-pnl.dg-pnl-neg { color: #f87171; }
+      #degen-turbo-panel .dg-stats-row {
+        display: flex; align-items: flex-end; gap: 6px; margin-top: 4px;
+      }
+      #degen-turbo-panel .dg-stats-row .dg-stats-block { flex: 1; min-width: 0; }
       #degen-turbo-panel #dg-history-btn {
         flex: 0 0 auto; padding: 4px 8px; background: #2a2a35; color: #ccc;
         border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 11px;
@@ -1029,7 +1121,11 @@
       #degen-turbo-panel .dg-mode-btn.dg-active { background: #e8e8ef; color: #000; border-color: #e8e8ef; font-weight: 600; }
       #degen-turbo-panel .dg-mode-pct { display: flex; gap: 4px; align-items: center; flex: 1; min-width: 0; }
       #degen-turbo-panel .dg-mode-pct input { flex: 1; min-width: 0; padding: 6px 4px; text-align: right; }
-      #degen-turbo-panel .dg-mode-pct span { color: #666; font-size: 10px; flex-shrink: 0; }
+      #degen-turbo-panel .dg-check-row {
+        display: flex; align-items: center; gap: 6px; margin: 6px 0;
+        font-size: 11px; color: #aaa; cursor: pointer;
+      }
+      #degen-turbo-panel .dg-check-row input { width: auto; flex: 0 0 auto; }
       #degen-turbo-panel .dg-stop-row { margin-bottom: 8px; }
       #degen-turbo-panel .dg-stop-head { display: flex; justify-content: space-between; font-size: 10px; color: #888; margin-bottom: 3px; }
       #degen-turbo-panel .dg-btns button { pointer-events: auto; position: relative; z-index: 1; }
@@ -1184,9 +1280,11 @@
             <div>
               <label>Variante</label>
               <select id="dg-keno-variant">
-                <option value="keno_10">Keno 10</option>
-                <option value="keno_20">Keno 20</option>
                 <option value="keno_40">Keno 40</option>
+                <option value="keno_50">Keno 50</option>
+                <option value="keno_60">Keno 60</option>
+                <option value="keno_70">Keno 70</option>
+                <option value="keno_80">Keno 80</option>
               </select>
             </div>
             <div>
@@ -1199,8 +1297,18 @@
               </select>
             </div>
           </div>
+          <label class="dg-check-row">
+            <input type="checkbox" id="dg-keno-random" ${cfg.kenoRandom ? "checked" : ""} />
+            Numéros aléatoires à chaque tour
+          </label>
+          <div class="dg-row">
+            <div>
+              <label>Nb numéros (aléatoire / champ vide)</label>
+              <input id="dg-keno-pick-count" type="number" min="1" max="80" value="${cfg.kenoPickCount}" />
+            </div>
+          </div>
           <label>Numéros (séparés par virgule)</label>
-          <input id="dg-keno-numbers" type="text" value="${cfg.kenoNumbers}" placeholder="20,12,13,21" />
+          <input id="dg-keno-numbers" type="text" value="${cfg.kenoNumbers}" placeholder="vide = aléatoire" />
         </div>
 
         <div id="dg-mines-fields" class="dg-fields" style="display:none">
@@ -1229,7 +1337,10 @@
         </div>
         <div id="dg-status">Prêt</div>
         <div class="dg-stats-row">
-          <div id="dg-stats">Paris: 0 | W: 0 L: 0 | P/L: 0</div>
+          <div class="dg-stats-block">
+            <div id="dg-stats">Paris: 0 · W: 0 · L: 0</div>
+            <div id="dg-stats-pnl" class="dg-pnl-pos">+0 ${cfg.asset || ""}</div>
+          </div>
           <button type="button" id="dg-history-btn" title="Historique des paris">📜</button>
         </div>
       </div>
@@ -1283,6 +1394,10 @@
     document.getElementById("dg-plinko-risk").value = cfg.plinkoRisk;
     document.getElementById("dg-keno-variant").value = cfg.kenoVariant;
     document.getElementById("dg-keno-risk").value = cfg.kenoRisk;
+    const kenoRandom = document.getElementById("dg-keno-random");
+    if (kenoRandom) kenoRandom.checked = cfg.kenoRandom;
+    const kenoPick = document.getElementById("dg-keno-pick-count");
+    if (kenoPick) kenoPick.value = String(cfg.kenoPickCount);
     toggleGameFields();
     setModeValue("win", cfg.winMode);
     setModeValue("loss", cfg.lossMode);
@@ -1308,6 +1423,10 @@
     document.getElementById("dg-reset").onclick = resetStats;
     document.getElementById("dg-close").onclick = () => { panel.style.display = "none"; };
     document.getElementById("dg-game").onchange = () => { readForm(); };
+    ["dg-keno-variant", "dg-keno-risk", "dg-keno-numbers", "dg-keno-pick-count"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("change", () => readForm());
+    });
+    document.getElementById("dg-keno-random")?.addEventListener("change", () => readForm());
 
     document.getElementById("dg-mines-schema-btn").onclick = openMinesModal;
     document.getElementById("dg-mines-modal-close").onclick = closeMinesModal;

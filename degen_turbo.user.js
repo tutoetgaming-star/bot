@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.2.1
+// @version      1.0.0
+// @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
+// @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
 // @match        https://degen.com/*
 // @match        https://www.degen.com/*
@@ -19,9 +21,11 @@
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
   const MIN_DELAY = 55; // limite site ~50 ms entre paris
+  const DEFAULT_ASSETS = ["BTC", "ETH", "USDC", "USDT", "LTC", "DOGE", "TRX", "XRP", "SOL"];
 
   const cfg = {
     game: GM_getValue("dg_game", "dice"),
+    asset: GM_getValue("dg_asset", "TRX"),
     betAmount: GM_getValue("dg_bet", "0.0001"),
     delayMs: parseInt(GM_getValue("dg_delay", String(MIN_DELAY)), 10) || MIN_DELAY,
     maxBets: parseInt(GM_getValue("dg_max", "0"), 10) || 0,
@@ -41,9 +45,11 @@
   const stats = { bets: 0, wins: 0, losses: 0, profit: 0 };
   let running = false;
   let abort = false;
+  let assetBalances = {};
 
   function save() {
     GM_setValue("dg_game", cfg.game);
+    GM_setValue("dg_asset", cfg.asset);
     GM_setValue("dg_bet", cfg.betAmount);
     GM_setValue("dg_delay", String(cfg.delayMs));
     GM_setValue("dg_max", String(cfg.maxBets));
@@ -72,6 +78,28 @@
     return WIN.crypto.randomUUID();
   }
 
+  async function apiGet(path) {
+    const res = await WIN.fetch(API + path, {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json" }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data?.message || data?.messages || res.statusText || "Erreur API");
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  function betBody(extra) {
+    const body = { ...extra };
+    if (cfg.asset) body.asset = cfg.asset;
+    return body;
+  }
+
   async function api(path, body) {
     const res = await WIN.fetch(API + path, {
       method: "POST",
@@ -90,27 +118,27 @@
   }
 
   async function betDice() {
-    return api("/games/dice/bet", {
+    return api("/games/dice/bet", betBody({
       gameSessionId: uuid(),
       betAmount: String(cfg.betAmount),
       betType: cfg.diceType,
       targetNumber: Number(cfg.diceTarget.toFixed(2))
-    });
+    }));
   }
 
   async function betLimbo() {
-    return api("/games/limbo/bet", {
+    return api("/games/limbo/bet", betBody({
       betAmount: String(cfg.betAmount),
       targetMultiplier: Number(cfg.limboMult)
-    });
+    }));
   }
 
   async function betPlinko() {
-    return api("/games/plinko/bet", {
+    return api("/games/plinko/bet", betBody({
       betAmount: String(cfg.betAmount),
       riskLevel: cfg.plinkoRisk,
       rowCount: cfg.plinkoRows
-    });
+    }));
   }
 
   function parseKenoNumbers() {
@@ -125,12 +153,12 @@
     if (selectedNumbers.length === 0) {
       throw new Error("Aucun numéro Keno valide");
     }
-    return api("/games/keno/bet", {
+    return api("/games/keno/bet", betBody({
       betAmount: String(cfg.betAmount),
       variantId: cfg.kenoVariant,
       riskLevel: cfg.kenoRisk,
       selectedNumbers
-    });
+    }));
   }
 
   const MINES_GRID = 25;
@@ -166,11 +194,11 @@
     const fixedTiles = parseMinesTiles();
     const reveals = Math.max(1, Math.min(cfg.minesReveals, MINES_GRID - cfg.minesCount));
 
-    let game = await api("/games/mines/start", {
+    let game = await api("/games/mines/start", betBody({
       betAmount: String(cfg.betAmount),
       minesCount: cfg.minesCount,
       gameSessionId: uuid()
-    });
+    }));
 
     for (let i = 0; i < reveals; i++) {
       if (game.status !== "ACTIVE") break;
@@ -222,7 +250,122 @@
     const el = document.getElementById("dg-stats");
     if (!el) return;
     el.textContent =
-      `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)}`;
+      `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)} ${cfg.asset}`;
+  }
+
+  function formatBalance(val) {
+    const n = parseFloat(val);
+    if (isNaN(n)) return val;
+    if (n === 0) return "0";
+    if (n < 0.0001) return n.toFixed(8);
+    if (n < 1) return n.toFixed(6);
+    return n.toFixed(4);
+  }
+
+  function parseAssetList(data) {
+    if (!data) return [];
+    const arr = Array.isArray(data)
+      ? data
+      : data.balances || data.assets || data.wallets || data.data || [];
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .map((item) => ({
+        asset: String(item.asset || item.symbol || item.currency || item.code || "").toUpperCase(),
+        balance: item.balance ?? item.amount ?? item.available ?? item.freeBalance
+      }))
+      .filter((x) => x.asset);
+  }
+
+  function detectPageAsset() {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        const val = localStorage.getItem(key);
+        if (!val) continue;
+        if (/asset|currency|wallet/i.test(key) && DEFAULT_ASSETS.includes(val.toUpperCase())) {
+          return val.toUpperCase();
+        }
+        try {
+          const j = JSON.parse(val);
+          const a = j?.asset || j?.selectedAsset || j?.activeAsset || j?.currency;
+          if (typeof a === "string" && a.length <= 6) return a.toUpperCase();
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function populateAssetSelect(list) {
+    const sel = document.getElementById("dg-asset");
+    if (!sel) return;
+    const current = cfg.asset;
+    const assets = new Map();
+
+    DEFAULT_ASSETS.forEach((a) => assets.set(a, assetBalances[a]));
+    list.forEach(({ asset, balance }) => {
+      assets.set(asset, balance ?? assetBalances[asset]);
+      if (balance != null) assetBalances[asset] = balance;
+    });
+    if (current) assets.set(current, assetBalances[current]);
+
+    sel.innerHTML = "";
+    [...assets.keys()].sort().forEach((asset) => {
+      const opt = document.createElement("option");
+      opt.value = asset;
+      const bal = assetBalances[asset];
+      opt.textContent = bal != null ? `${asset} (${formatBalance(bal)})` : asset;
+      sel.appendChild(opt);
+    });
+
+    if (current && assets.has(current)) sel.value = current;
+    else if (sel.options.length) {
+      sel.value = sel.options[0].value;
+      cfg.asset = sel.value;
+    }
+    updateAssetBalanceHint();
+  }
+
+  function updateAssetBalanceHint() {
+    const el = document.getElementById("dg-asset-balance");
+    if (!el) return;
+    const bal = assetBalances[cfg.asset];
+    el.textContent = bal != null ? `Solde: ${formatBalance(bal)} ${cfg.asset}` : "";
+  }
+
+  async function loadAssets() {
+    const btn = document.getElementById("dg-asset-refresh");
+    if (btn) btn.disabled = true;
+    setStatus("Chargement cryptos…");
+
+    const paths = ["/wallet/balances", "/wallets", "/user/balances", "/balances"];
+    let list = [];
+
+    for (const path of paths) {
+      try {
+        const data = await apiGet(path);
+        list = parseAssetList(data);
+        if (list.length) break;
+      } catch (_) {}
+    }
+
+    if (!list.length) {
+      list = DEFAULT_ASSETS.map((asset) => ({ asset, balance: assetBalances[asset] }));
+    }
+
+    populateAssetSelect(list);
+
+    const pageAsset = detectPageAsset();
+    if (pageAsset) {
+      const sel = document.getElementById("dg-asset");
+      if (sel && [...sel.options].some((o) => o.value === pageAsset)) {
+        sel.value = pageAsset;
+        cfg.asset = pageAsset;
+        GM_setValue("dg_asset", cfg.asset);
+      }
+    }
+
+    if (btn) btn.disabled = false;
+    setStatus("Prêt — crypto: " + cfg.asset);
   }
 
   async function runLoop() {
@@ -291,6 +434,7 @@
 
   function readForm() {
     cfg.game = document.getElementById("dg-game").value;
+    cfg.asset = document.getElementById("dg-asset").value;
     cfg.betAmount = document.getElementById("dg-bet").value.trim();
     cfg.delayMs = parseInt(document.getElementById("dg-delay").value, 10) || MIN_DELAY;
     cfg.maxBets = parseInt(document.getElementById("dg-max").value, 10) || 0;
@@ -306,6 +450,8 @@
     cfg.minesReveals = parseInt(document.getElementById("dg-mines-reveals").value, 10) || 1;
     cfg.minesTiles = document.getElementById("dg-mines-tiles").value.trim();
     save();
+    updateAssetBalanceHint();
+    updateStats();
     toggleGameFields();
   }
 
@@ -406,6 +552,15 @@
         background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 0 4px;
       }
       #degen-turbo-panel .dg-fields { margin-top: 4px; }
+      #degen-turbo-panel .dg-asset-row { display: flex; gap: 6px; align-items: stretch; }
+      #degen-turbo-panel .dg-asset-row select { flex: 1; }
+      #degen-turbo-panel #dg-asset-refresh {
+        flex: 0 0 32px; padding: 0; background: #2a2a35; color: #ccc;
+        border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 14px;
+      }
+      #degen-turbo-panel #dg-asset-refresh:hover { background: #333; color: #fff; }
+      #degen-turbo-panel #dg-asset-refresh:disabled { opacity: .5; cursor: wait; }
+      #dg-asset-balance { font-size: 10px; color: #6ee7b7; margin-top: 2px; min-height: 14px; }
       #degen-turbo-panel .dg-label-row {
         display: flex; align-items: center; justify-content: space-between; margin: 6px 0 3px;
       }
@@ -466,6 +621,13 @@
           <option value="keno">Keno</option>
           <option value="mines">Mines</option>
         </select>
+
+        <label>Crypto</label>
+        <div class="dg-asset-row">
+          <select id="dg-asset"></select>
+          <button type="button" id="dg-asset-refresh" title="Charger soldes">↻</button>
+        </div>
+        <div id="dg-asset-balance"></div>
 
         <label>Mise</label>
         <input id="dg-bet" type="text" value="${cfg.betAmount}" />
@@ -590,6 +752,9 @@
     `;
     document.body.appendChild(modal);
 
+    populateAssetSelect(DEFAULT_ASSETS.map((a) => ({ asset: a })));
+    document.getElementById("dg-asset").value = cfg.asset;
+
     document.getElementById("dg-game").value = cfg.game;
     document.getElementById("dg-dice-type").value = cfg.diceType;
     document.getElementById("dg-plinko-risk").value = cfg.plinkoRisk;
@@ -602,6 +767,9 @@
     document.getElementById("dg-reset").onclick = resetStats;
     document.getElementById("dg-close").onclick = () => { panel.style.display = "none"; };
     document.getElementById("dg-game").onchange = () => { readForm(); };
+    document.getElementById("dg-asset").onchange = () => { readForm(); };
+    document.getElementById("dg-asset-refresh").onclick = loadAssets;
+    loadAssets();
 
     document.getElementById("dg-mines-schema-btn").onclick = openMinesModal;
     document.getElementById("dg-mines-modal-close").onclick = closeMinesModal;

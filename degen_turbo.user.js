@@ -20,6 +20,7 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
+  const SCRIPT_VERSION = "1.8.4";
   const MIN_DELAY = 30; // limite site ~50 ms entre paris
   const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
@@ -1055,7 +1056,7 @@
     panel.id = "degen-turbo-panel";
     panel.innerHTML = `
       <div class="dg-head">
-        <span>⚡ Degen Turbo</span>
+        <span>⚡ Degen Turbo v${SCRIPT_VERSION}</span>
         <button class="dg-close" id="dg-close" title="Masquer">×</button>
       </div>
       <div class="dg-body">

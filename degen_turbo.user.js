@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.8.4
+// @version      1.8.5
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -20,7 +20,7 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.8.4";
+  const SCRIPT_VERSION = "1.8.5";
   const MIN_DELAY = 30; // limite site ~50 ms entre paris
   const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
@@ -900,8 +900,21 @@
     refreshReadyStatus();
   }
 
+  function updatePanelTitle() {
+    const ver = document.querySelector("#dg-title .dg-version");
+    if (ver) {
+      ver.textContent = "v" + SCRIPT_VERSION;
+      return;
+    }
+    const el = document.getElementById("dg-title");
+    if (el) el.textContent = "⚡ Degen Turbo v" + SCRIPT_VERSION;
+  }
+
   function buildUI() {
-    if (document.getElementById("degen-turbo-panel")) return;
+    if (document.getElementById("degen-turbo-panel")) {
+      updatePanelTitle();
+      return;
+    }
 
     GM_addStyle(`
       #degen-turbo-panel {
@@ -916,7 +929,9 @@
         padding: 10px 12px; background: #1a1a22; border-radius: 10px 10px 0 0;
         cursor: move; user-select: none; font-weight: 600; font-size: 13px;
       }
-      #degen-turbo-panel .dg-body { padding: 10px 12px; max-height: 75vh; overflow-y: auto; }
+      #degen-turbo-panel .dg-head .dg-version {
+        color: #93c5fd; font-weight: 500; font-size: 11px; margin-left: 4px;
+      }
       #degen-turbo-panel label { display: block; margin: 6px 0 3px; color: #999; font-size: 11px; }
       #degen-turbo-panel input, #degen-turbo-panel select {
         width: 100%; padding: 6px 8px; background: #0d0d10; border: 1px solid #333;
@@ -1056,7 +1071,7 @@
     panel.id = "degen-turbo-panel";
     panel.innerHTML = `
       <div class="dg-head">
-        <span>⚡ Degen Turbo v${SCRIPT_VERSION}</span>
+        <span id="dg-title">⚡ Degen Turbo<span class="dg-version">v${SCRIPT_VERSION}</span></span>
         <button class="dg-close" id="dg-close" title="Masquer">×</button>
       </div>
       <div class="dg-body">

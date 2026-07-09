@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.8.2
+// @version      1.8.4
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -230,8 +230,45 @@
     return WIN.crypto.randomUUID();
   }
 
+  function parseAmount(str) {
+    if (str == null || str === "") return 0;
+    const n = parseFloat(String(str).trim().replace(/\s/g, "").replace(",", "."));
+    return isNaN(n) ? 0 : n;
+  }
+
+  function betDecimals(asset) {
+    const a = String(asset || cfg.asset || "").toUpperCase();
+    if (a === "USDT" || a === "USDC") return 4;
+    if (a === "TRX" || a === "DOGE" || a === "XRP") return 6;
+    return 8;
+  }
+
+  function formatBetAmount(amount) {
+    const n = typeof amount === "number" ? amount : parseAmount(amount);
+    if (!n || n <= 0) return "0";
+    const dec = betDecimals(cfg.asset);
+    const rounded = Math.round(n * 10 ** dec) / 10 ** dec;
+    return rounded.toFixed(dec);
+  }
+
+  function clampDiceTarget(value) {
+    const n = typeof value === "number" ? value : parseAmount(value);
+    return Math.min(99.99, Math.max(0.01, Math.round(n * 100) / 100));
+  }
+
+  function clampLimboMult(value) {
+    const n = typeof value === "number" ? value : parseAmount(value);
+    return Math.min(1000000, Math.max(1.01, Math.round(n * 100) / 100));
+  }
+
+  function clampPlinkoRows(value) {
+    const n = parseInt(value, 10) || 8;
+    return Math.min(16, Math.max(8, n));
+  }
+
   function betBody(extra) {
     const body = { ...extra };
+    if (body.betAmount != null) body.betAmount = formatBetAmount(body.betAmount);
     if (cfg.asset) body.asset = cfg.asset;
     return body;
   }
@@ -289,24 +326,24 @@
   async function betDice() {
     return api("/games/dice/bet", betBody({
       gameSessionId: uuid(),
-      betAmount: String(cfg.betAmount),
+      betAmount: cfg.betAmount,
       betType: cfg.diceType,
-      targetNumber: Number(cfg.diceTarget.toFixed(2))
+      targetNumber: clampDiceTarget(cfg.diceTarget)
     }));
   }
 
   async function betLimbo() {
     return api("/games/limbo/bet", betBody({
-      betAmount: String(cfg.betAmount),
-      targetMultiplier: Number(cfg.limboMult)
+      betAmount: cfg.betAmount,
+      targetMultiplier: clampLimboMult(cfg.limboMult)
     }));
   }
 
   async function betPlinko() {
     return api("/games/plinko/bet", betBody({
-      betAmount: String(cfg.betAmount),
+      betAmount: cfg.betAmount,
       riskLevel: cfg.plinkoRisk,
-      rowCount: cfg.plinkoRows
+      rowCount: clampPlinkoRows(cfg.plinkoRows)
     }));
   }
 
@@ -323,7 +360,7 @@
       throw new Error("Aucun numéro Keno valide");
     }
     return api("/games/keno/bet", betBody({
-      betAmount: String(cfg.betAmount),
+      betAmount: cfg.betAmount,
       variantId: cfg.kenoVariant,
       riskLevel: cfg.kenoRisk,
       selectedNumbers
@@ -452,7 +489,7 @@
     const reveals = Math.max(1, Math.min(cfg.minesReveals, MINES_GRID - cfg.minesCount));
 
     let game = await minesStart(betBody({
-      betAmount: String(cfg.betAmount),
+      betAmount: cfg.betAmount,
       minesCount: cfg.minesCount,
       gameSessionId: uuid()
     }));
@@ -583,7 +620,7 @@
   }
 
   function recordResult(data) {
-    const bet = parseFloat(data.betAmount || cfg.betAmount) || 0;
+    const bet = parseAmount(data.betAmount || cfg.betAmount) || 0;
     const win = parseFloat(data.winAmount || data.finalPayout || 0) || 0;
     const delta = win - bet;
     stats.bets++;
@@ -596,17 +633,18 @@
   }
 
   function applyBetProgression(won) {
-    const bet = parseFloat(cfg.betAmount) || parseFloat(baseBetAmount) || 0;
+    const bet = parseAmount(cfg.betAmount) || parseAmount(baseBetAmount) || 0;
     let next = bet;
     if (won) {
-      if (cfg.winMode === "reset") next = parseFloat(baseBetAmount) || bet;
+      if (cfg.winMode === "reset") next = parseAmount(baseBetAmount) || bet;
       else if (cfg.winPct > 0) next = bet * (1 + cfg.winPct / 100);
     } else if (cfg.lossMode === "reset") {
-      next = parseFloat(baseBetAmount) || bet;
+      next = parseAmount(baseBetAmount) || bet;
     } else if (cfg.lossPct > 0) {
       next = bet * (1 + cfg.lossPct / 100);
     }
-    cfg.betAmount = String(next);
+    cfg.betAmount = formatBetAmount(next);
+    GM_setValue("dg_bet", cfg.betAmount);
     const el = document.getElementById("dg-bet");
     if (el) el.value = cfg.betAmount;
   }
@@ -681,7 +719,7 @@
     }
     running = true;
     abort = false;
-    baseBetAmount = cfg.betAmount;
+    baseBetAmount = formatBetAmount(cfg.betAmount);
     setStatus("En cours…");
 
     const betFn = betFns[cfg.game];
@@ -762,14 +800,14 @@
 
   function readForm() {
     cfg.game = document.getElementById("dg-game").value;
-    cfg.betAmount = document.getElementById("dg-bet").value.trim();
+    cfg.betAmount = formatBetAmount(document.getElementById("dg-bet").value);
     cfg.delayMs = parseInt(document.getElementById("dg-delay").value, 10) || MIN_DELAY;
     cfg.maxBets = parseInt(document.getElementById("dg-max").value, 10) || 0;
     cfg.diceType = document.getElementById("dg-dice-type").value;
-    cfg.diceTarget = parseFloat(document.getElementById("dg-dice-target").value) || 50;
-    cfg.limboMult = parseFloat(document.getElementById("dg-limbo-mult").value) || 2;
+    cfg.diceTarget = clampDiceTarget(document.getElementById("dg-dice-target").value);
+    cfg.limboMult = clampLimboMult(document.getElementById("dg-limbo-mult").value);
     cfg.plinkoRisk = document.getElementById("dg-plinko-risk").value;
-    cfg.plinkoRows = parseInt(document.getElementById("dg-plinko-rows").value, 10) || 8;
+    cfg.plinkoRows = clampPlinkoRows(document.getElementById("dg-plinko-rows").value);
     cfg.kenoVariant = document.getElementById("dg-keno-variant").value;
     cfg.kenoRisk = document.getElementById("dg-keno-risk").value;
     cfg.kenoNumbers = document.getElementById("dg-keno-numbers").value.trim();
@@ -777,11 +815,11 @@
     cfg.minesReveals = parseInt(document.getElementById("dg-mines-reveals").value, 10) || 1;
     cfg.minesTiles = document.getElementById("dg-mines-tiles").value.trim();
     cfg.winMode = getModeValue("win");
-    cfg.winPct = parseFloat(document.getElementById("dg-win-pct").value) || 0;
+    cfg.winPct = parseAmount(document.getElementById("dg-win-pct").value) || 0;
     cfg.lossMode = getModeValue("loss");
-    cfg.lossPct = parseFloat(document.getElementById("dg-loss-pct").value) || 0;
-    cfg.stopProfit = parseFloat(document.getElementById("dg-stop-profit").value) || 0;
-    cfg.stopLoss = parseFloat(document.getElementById("dg-stop-loss").value) || 0;
+    cfg.lossPct = parseAmount(document.getElementById("dg-loss-pct").value) || 0;
+    cfg.stopProfit = parseAmount(document.getElementById("dg-stop-profit").value) || 0;
+    cfg.stopLoss = parseAmount(document.getElementById("dg-stop-loss").value) || 0;
     save();
     refreshReadyStatus();
     updateStats();

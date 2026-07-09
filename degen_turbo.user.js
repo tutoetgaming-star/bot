@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.4.0
+// @version      1.8.0
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -12,7 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_addStyle
 // @connect      api.degen.com
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -20,12 +20,19 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const MIN_DELAY = 55; // limite site ~50 ms entre paris
-  const DEFAULT_ASSETS = ["BTC", "ETH", "USDC", "USDT", "LTC", "DOGE", "TRX", "XRP", "SOL"];
+  const MIN_DELAY = 30; // limite site ~50 ms entre paris
+  const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
+  const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
+  const KNOWN_SET = new Set(KNOWN_ASSETS);
+  const HISTORY_MAX = 300;
+  const BIG_WIN_MULT = 2;
+
+  let lastBalanceData = null;
+  let assetSyncTimer = null;
 
   const cfg = {
     game: GM_getValue("dg_game", "dice"),
-    asset: "TRX",
+    asset: "",
     betAmount: GM_getValue("dg_bet", "0.0001"),
     delayMs: parseInt(GM_getValue("dg_delay", String(MIN_DELAY)), 10) || MIN_DELAY,
     maxBets: parseInt(GM_getValue("dg_max", "0"), 10) || 0,
@@ -39,14 +46,213 @@
     kenoNumbers: GM_getValue("dg_keno_numbers", "1,2,3,4"),
     minesCount: parseInt(GM_getValue("dg_mines_count", "3"), 10) || 3,
     minesReveals: parseInt(GM_getValue("dg_mines_reveals", "1"), 10) || 1,
-    minesTiles: GM_getValue("dg_mines_tiles", "")
+    minesTiles: GM_getValue("dg_mines_tiles", ""),
+    winMode: GM_getValue("dg_win_mode", "reset"),
+    winPct: parseFloat(GM_getValue("dg_win_pct", "0")) || 0,
+    lossMode: GM_getValue("dg_loss_mode", "reset"),
+    lossPct: parseFloat(GM_getValue("dg_loss_pct", "0")) || 0,
+    stopProfit: parseFloat(GM_getValue("dg_stop_profit", "0")) || 0,
+    stopLoss: parseFloat(GM_getValue("dg_stop_loss", "0")) || 0
   };
 
+  function setAsset(asset) {
+    if (!asset) return;
+    const next = String(asset).toUpperCase();
+    if (next === cfg.asset) return;
+    cfg.asset = next;
+    refreshReadyStatus();
+    updateStats();
+  }
+
+  function resolveAssetFromBalance(data, reqAsset) {
+    if (!Array.isArray(data) || !data.length) return;
+    lastBalanceData = data;
+    const fromPrimary = data.find((x) => x.isPrimary === true);
+    const asset = reqAsset
+      ? String(reqAsset).toUpperCase()
+      : fromPrimary?.asset;
+    setAsset(asset);
+  }
+
+  function deepFindAsset(obj, depth = 0) {
+    if (!obj || depth > 8) return null;
+    if (typeof obj === "string") {
+      const up = obj.toUpperCase();
+      return KNOWN_SET.has(up) ? up : null;
+    }
+    if (typeof obj !== "object") return null;
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const f = deepFindAsset(item, depth + 1);
+        if (f) return f;
+      }
+      return null;
+    }
+    for (const [k, v] of Object.entries(obj)) {
+      if (/asset|currency|primary|wallet|balance/i.test(k) && typeof v === "string") {
+        const up = v.toUpperCase();
+        if (KNOWN_SET.has(up)) return up;
+      }
+      const f = deepFindAsset(v, depth + 1);
+      if (f) return f;
+    }
+    return null;
+  }
+
+  function detectAssetDeepStorage() {
+    for (const store of [localStorage, sessionStorage]) {
+      try {
+        for (let i = 0; i < store.length; i++) {
+          const val = store.getItem(store.key(i));
+          if (!val) continue;
+          try {
+            const found = deepFindAsset(JSON.parse(val));
+            if (found) return found;
+          } catch (_) {
+            for (const a of KNOWN_ASSETS) {
+              if (val.includes(`"asset":"${a}"`) || val.includes(`"asset":"${a.toLowerCase()}"`)) return a;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function detectAssetFromDOM() {
+    try {
+      const els = document.querySelectorAll(
+        "[data-asset], [data-currency], [data-symbol], [class*='wallet'], [class*='balance'], [class*='currency']"
+      );
+      for (const el of els) {
+        const raw = el.dataset?.asset || el.dataset?.currency || el.dataset?.symbol;
+        if (raw && KNOWN_SET.has(String(raw).toUpperCase())) return String(raw).toUpperCase();
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function detectAssetLocalStorage() {
+    return detectAssetDeepStorage();
+  }
+
+  function pickAssetHint() {
+    return detectAssetDeepStorage() || detectAssetFromDOM();
+  }
+
+  async function patchBalancePrimary(asset) {
+    const res = await WIN.fetch(API + "/balance/primary", {
+      method: "PATCH",
+      credentials: "include",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ asset })
+    });
+    const data = await res.json().catch(() => []);
+    if (!res.ok || !Array.isArray(data)) return null;
+    return data;
+  }
+
+  async function forceFetchPrimaryAsset() {
+    if (cfg.asset && lastBalanceData?.length) return true;
+
+    if (lastBalanceData?.length) {
+      const primary = lastBalanceData.find((x) => x.isPrimary === true);
+      if (primary?.asset) {
+        setAsset(primary.asset);
+        return true;
+      }
+    }
+
+    const hint = pickAssetHint();
+    const data = await patchBalancePrimary(hint || "USDT");
+    if (data) {
+      resolveAssetFromBalance(data, null);
+      return !!cfg.asset;
+    }
+    return false;
+  }
+
+  async function autoDetectAsset() {
+    if (await forceFetchPrimaryAsset()) return true;
+    return !!cfg.asset;
+  }
+
+  function parseReqAsset(body) {
+    if (!body) return null;
+    try {
+      const parsed = typeof body === "string" ? JSON.parse(body) : body;
+      return parsed?.asset || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function installAssetHooks() {
+    const origFetch = WIN.fetch;
+    if (!origFetch._dgAssetHooked) {
+      WIN.fetch = async function (input, init) {
+        const url = typeof input === "string" ? input : input?.url || "";
+        const isBalance = /\/balance\/primary/.test(url);
+        const reqAsset = isBalance ? parseReqAsset(init?.body) : null;
+        const res = await origFetch.apply(this, arguments);
+        if (isBalance && res.ok) {
+          try {
+            const data = await res.clone().json();
+            resolveAssetFromBalance(data, reqAsset);
+          } catch (_) {}
+        }
+        return res;
+      };
+      WIN.fetch._dgAssetHooked = true;
+    }
+
+    if (!XMLHttpRequest.prototype._dgAssetHooked) {
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        this._dgUrl = String(url || "");
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function (body) {
+        this.addEventListener("load", function () {
+          if (!/\/balance\/primary/.test(this._dgUrl || "")) return;
+          if (this.status < 200 || this.status >= 300) return;
+          try {
+            const data = JSON.parse(this.responseText);
+            resolveAssetFromBalance(data, parseReqAsset(body));
+          } catch (_) {}
+        });
+        return origSend.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype._dgAssetHooked = true;
+    }
+  }
+  installAssetHooks();
+
   const stats = { bets: 0, wins: 0, losses: 0, profit: 0 };
+  let history = [];
+  let historyFilter = "all";
+  try {
+    history = JSON.parse(GM_getValue("dg_history", "[]")) || [];
+  } catch (_) {
+    history = [];
+  }
   let running = false;
   let abort = false;
-  let liveBalance = null;
-  let balanceSyncTimer = null;
+  let baseBetAmount = cfg.betAmount;
+
+  function startAssetSync() {
+    const tick = () => autoDetectAsset().then(() => {
+      if (!running) refreshReadyStatus();
+    });
+    tick();
+    if (assetSyncTimer) clearInterval(assetSyncTimer);
+    assetSyncTimer = setInterval(tick, 2000);
+    WIN.addEventListener("load", () => setTimeout(tick, 1500));
+  }
 
   function save() {
     GM_setValue("dg_game", cfg.game);
@@ -64,6 +270,12 @@
     GM_setValue("dg_mines_count", String(cfg.minesCount));
     GM_setValue("dg_mines_reveals", String(cfg.minesReveals));
     GM_setValue("dg_mines_tiles", cfg.minesTiles);
+    GM_setValue("dg_win_mode", cfg.winMode);
+    GM_setValue("dg_win_pct", String(cfg.winPct));
+    GM_setValue("dg_loss_mode", cfg.lossMode);
+    GM_setValue("dg_loss_pct", String(cfg.lossPct));
+    GM_setValue("dg_stop_profit", String(cfg.stopProfit));
+    GM_setValue("dg_stop_loss", String(cfg.stopLoss));
   }
 
   function log(...args) {
@@ -78,15 +290,38 @@
     return WIN.crypto.randomUUID();
   }
 
+  function betBody(extra) {
+    const body = { ...extra };
+    if (cfg.asset) body.asset = cfg.asset;
+    return body;
+  }
+
+  function formatApiError(data, res) {
+    if (!data) return res?.statusText || "Erreur API";
+    const m = data.message;
+    if (typeof m === "string") return m;
+    if (m && typeof m.message === "string") return m.message;
+    if (Array.isArray(data.messages)) return data.messages.join(", ");
+    if (typeof data.messages === "string") return data.messages;
+    if (m && typeof m === "object") {
+      return m.error || String(m.statusCode || "") || JSON.stringify(m);
+    }
+    try {
+      return JSON.stringify(data);
+    } catch (_) {
+      return "Erreur API";
+    }
+  }
+
   async function apiGet(path) {
     const res = await WIN.fetch(API + path, {
       method: "GET",
       credentials: "include",
-      headers: { Accept: "application/json" }
+      headers: { Accept: "application/json, text/plain, */*" }
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = new Error(data?.message || data?.messages || res.statusText || "Erreur API");
+      const err = new Error(formatApiError(data, res));
       err.status = res.status;
       err.data = data;
       throw err;
@@ -94,22 +329,19 @@
     return data;
   }
 
-  function betBody(extra) {
-    const body = { ...extra };
-    if (cfg.asset) body.asset = cfg.asset;
-    return body;
-  }
-
   async function api(path, body) {
     const res = await WIN.fetch(API + path, {
       method: "POST",
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify(body)
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const err = new Error(data?.message || data?.messages || res.statusText || "Erreur API");
+      const err = new Error(formatApiError(data, res));
       err.status = res.status;
       err.data = data;
       throw err;
@@ -190,11 +422,120 @@
     };
   }
 
+  function extractActiveMinesGame(data) {
+    if (!data) return null;
+    if (data.id && (data.status === "ACTIVE" || !data.status)) return data;
+    if (data.game?.id) return data.game;
+    if (Array.isArray(data)) {
+      return data.find((g) => g.status === "ACTIVE") || data[0] || null;
+    }
+    return null;
+  }
+
+  function extractGameIdFromError(data) {
+    if (!data) return null;
+    if (data.id) return data.id;
+    if (data.gameId) return data.gameId;
+    if (data.game?.id) return data.game.id;
+    const m = data.message;
+    if (m?.gameId) return m.gameId;
+    if (m?.id) return m.id;
+    try {
+      const hit = JSON.stringify(data).match(/"gameId"\s*:\s*"([^"]+)"/);
+      return hit?.[1] || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function findActiveMinesGame() {
+    const paths = [
+      "/games/mines/active",
+      "/games/mines/current",
+      "/games/mines/state",
+      "/games/mines"
+    ];
+    for (const path of paths) {
+      try {
+        const data = await apiGet(path);
+        const game = extractActiveMinesGame(data);
+        if (game?.id) return game;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  async function cashoutMinesGame(gameId) {
+    if (!gameId) return false;
+    try {
+      await api("/games/mines/cashout", { gameId });
+      await sleep(MINES_STEP_MS);
+      return true;
+    } catch (e) {
+      log("Cashout échoué:", e.message);
+      return false;
+    }
+  }
+
+  async function abandonMinesGame(gameId) {
+    if (!gameId) return false;
+    const paths = ["/games/mines/abandon", "/games/mines/forfeit", "/games/mines/cancel"];
+    for (const path of paths) {
+      try {
+        await api(path, { gameId });
+        await sleep(MINES_STEP_MS);
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  async function closeActiveMinesGame(quiet) {
+    const active = await findActiveMinesGame();
+    let gameId = active?.id;
+
+    if (!gameId) return false;
+
+    if (!quiet) setStatus(`Partie Mines en cours — cashout…`);
+
+    if (await cashoutMinesGame(gameId)) {
+      if (!quiet) setStatus("Partie Mines récupérée (cashout)");
+      return true;
+    }
+    if (await abandonMinesGame(gameId)) {
+      if (!quiet) setStatus("Partie Mines fermée (abandon)");
+      return true;
+    }
+    return false;
+  }
+
+  async function recoverMinesFromError(err) {
+    let gameId = extractGameIdFromError(err?.data);
+    if (gameId) {
+      if (await cashoutMinesGame(gameId)) return true;
+      if (await abandonMinesGame(gameId)) return true;
+    }
+    return closeActiveMinesGame(true);
+  }
+
+  async function minesStart(payload) {
+    await closeActiveMinesGame(true);
+    try {
+      return await api("/games/mines/start", payload);
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      log("Mines start 400 — récupération…", e.data);
+      await recoverMinesFromError(e);
+      await sleep(350);
+      return await api("/games/mines/start", payload);
+    }
+  }
+
   async function betMines() {
     const fixedTiles = parseMinesTiles();
     const reveals = Math.max(1, Math.min(cfg.minesReveals, MINES_GRID - cfg.minesCount));
 
-    let game = await api("/games/mines/start", betBody({
+    let game = await minesStart(betBody({
       betAmount: String(cfg.betAmount),
       minesCount: cfg.minesCount,
       gameSessionId: uuid()
@@ -203,6 +544,7 @@
     for (let i = 0; i < reveals; i++) {
       if (game.status !== "ACTIVE") break;
 
+      await sleep(MINES_STEP_MS);
       const tile = fixedTiles[i] ?? pickMinesTile(game.revealedTiles || []);
       game = await api("/games/mines/reveal", {
         gameId: game.id,
@@ -215,9 +557,11 @@
     }
 
     if (game.status === "ACTIVE") {
+      await sleep(MINES_STEP_MS);
       game = await api("/games/mines/cashout", { gameId: game.id });
     }
 
+    await sleep(MINES_STEP_MS);
     return normalizeMinesResult(game, false);
   }
 
@@ -229,19 +573,149 @@
     mines: betMines
   };
 
+  function formatAmt(n) {
+    const v = parseFloat(n);
+    if (isNaN(v)) return String(n);
+    if (Math.abs(v) === 0) return "0";
+    if (Math.abs(v) < 0.0001) return v.toFixed(8);
+    if (Math.abs(v) < 1) return v.toFixed(6);
+    return v.toFixed(4);
+  }
+
+  function getBetDetail(data) {
+    return data.minesDetail ?? data.rollResult ?? data.resultMultiplier
+      ?? (data.matches != null ? `${data.matches} match ×${data.payoutMultiplier}` : null)
+      ?? "—";
+  }
+
+  function saveHistory() {
+    if (history.length > HISTORY_MAX) history.length = HISTORY_MAX;
+    GM_setValue("dg_history", JSON.stringify(history));
+  }
+
+  function addHistoryEntry(data, won, bet, win, profit) {
+    const mult = bet > 0 ? win / bet : 0;
+    history.unshift({
+      id: stats.bets,
+      time: Date.now(),
+      game: cfg.game,
+      asset: cfg.asset || "",
+      bet,
+      win,
+      profit,
+      mult,
+      won,
+      big: won && mult >= BIG_WIN_MULT,
+      detail: getBetDetail(data),
+      status: data.status || ""
+    });
+    saveHistory();
+    if (document.getElementById("dg-history-modal")?.classList.contains("dg-open")) {
+      renderHistory();
+    }
+  }
+
+  function renderHistory() {
+    const list = document.getElementById("dg-history-list");
+    const summary = document.getElementById("dg-history-summary");
+    if (!list) return;
+
+    const items = historyFilter === "big" ? history.filter((h) => h.big) : history;
+    const bigCount = history.filter((h) => h.big).length;
+    const best = history.reduce((b, h) => (h.profit > 0 && (!b || h.profit > b.profit) ? h : b), null);
+
+    if (summary) {
+      summary.textContent = `${history.length} paris · ${bigCount} gros gains · Meilleur: +${best ? formatAmt(best.profit) : "0"} ${best?.asset || cfg.asset || ""}`;
+    }
+
+    if (!items.length) {
+      list.innerHTML = `<div class="dg-hist-empty">${historyFilter === "big" ? "Aucun gros gain" : "Aucun pari enregistré"}</div>`;
+      return;
+    }
+
+    list.innerHTML = items.map((h) => `
+      <div class="dg-hist-item ${h.big ? "dg-hist-big" : ""} ${h.won ? "dg-hist-win" : "dg-hist-loss"}">
+        <div class="dg-hist-top">
+          <span>#${h.id} · ${h.game} ${h.big ? "🔥" : ""}</span>
+          <span>${new Date(h.time).toLocaleTimeString()}</span>
+        </div>
+        <div class="dg-hist-detail">${h.detail}</div>
+        <div class="dg-hist-bottom">
+          <span>Mise ${formatAmt(h.bet)}</span>
+          <span class="${h.profit >= 0 ? "dg-hist-pos" : "dg-hist-neg"}">${h.profit >= 0 ? "+" : ""}${formatAmt(h.profit)} ${h.asset}</span>
+          ${h.mult > 0 ? `<span>×${h.mult.toFixed(2)}</span>` : ""}
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function openHistoryModal() {
+    document.getElementById("dg-history-modal")?.classList.add("dg-open");
+    renderHistory();
+  }
+
+  function closeHistoryModal() {
+    document.getElementById("dg-history-modal")?.classList.remove("dg-open");
+  }
+
+  function clearHistory() {
+    history = [];
+    saveHistory();
+    renderHistory();
+  }
+
   function recordResult(data) {
     const bet = parseFloat(data.betAmount || cfg.betAmount) || 0;
     const win = parseFloat(data.winAmount || data.finalPayout || 0) || 0;
     const delta = win - bet;
     stats.bets++;
     stats.profit += delta;
-    const won = data.status === "WON" || win > 0;
+    const won = data.status === "WON" || data.status === "COMPLETED" || win > bet;
     if (won) stats.wins++;
     else stats.losses++;
-    if (liveBalance != null) {
-      liveBalance += delta;
-      updateLiveBalanceDisplay();
+    addHistoryEntry(data, won, bet, win, delta);
+    applyBetProgression(won);
+  }
+
+  function applyBetProgression(won) {
+    const bet = parseFloat(cfg.betAmount) || parseFloat(baseBetAmount) || 0;
+    let next = bet;
+    if (won) {
+      if (cfg.winMode === "reset") next = parseFloat(baseBetAmount) || bet;
+      else if (cfg.winPct > 0) next = bet * (1 + cfg.winPct / 100);
+    } else if (cfg.lossMode === "reset") {
+      next = parseFloat(baseBetAmount) || bet;
+    } else if (cfg.lossPct > 0) {
+      next = bet * (1 + cfg.lossPct / 100);
     }
+    cfg.betAmount = String(next);
+    const el = document.getElementById("dg-bet");
+    if (el) el.value = cfg.betAmount;
+  }
+
+  function checkStopLimits() {
+    if (cfg.stopProfit > 0 && stats.profit >= cfg.stopProfit) {
+      setStatus(`Stop profit atteint: +${stats.profit.toFixed(8)} ${cfg.asset}`);
+      return true;
+    }
+    if (cfg.stopLoss > 0 && stats.profit <= -cfg.stopLoss) {
+      setStatus(`Stop perte atteint: ${stats.profit.toFixed(8)} ${cfg.asset}`);
+      return true;
+    }
+    return false;
+  }
+
+  function getModeValue(group) {
+    const btn = document.querySelector(`.dg-mode-btn[data-group="${group}"].dg-active`);
+    return btn?.dataset.value || "reset";
+  }
+
+  function setModeValue(group, value) {
+    document.querySelectorAll(`.dg-mode-btn[data-group="${group}"]`).forEach((b) => {
+      b.classList.toggle("dg-active", b.dataset.value === value);
+    });
+    const pct = document.getElementById(group === "win" ? "dg-win-pct" : "dg-loss-pct");
+    if (pct) pct.disabled = value === "reset";
   }
 
   function setStatus(msg) {
@@ -250,126 +724,39 @@
     log(msg);
   }
 
+  function refreshReadyStatus() {
+    setStatus(cfg.asset ? `Prêt — ${cfg.asset}` : "Détection crypto…");
+  }
+
   function updateStats() {
     const el = document.getElementById("dg-stats");
     if (!el) return;
     el.textContent =
-      `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)} ${cfg.asset}`;
+      `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)} ${cfg.asset || ""}`;
   }
 
-  function formatBalance(val) {
-    const n = parseFloat(val);
-    if (isNaN(n)) return val;
-    if (n === 0) return "0";
-    if (n < 0.0001) return n.toFixed(8);
-    if (n < 1) return n.toFixed(6);
-    return n.toFixed(4);
-  }
-
-  function parseAssetList(data) {
-    if (!data) return [];
-    const arr = Array.isArray(data)
-      ? data
-      : data.balances || data.assets || data.wallets || data.data || [];
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .map((item) => ({
-        asset: String(item.asset || item.symbol || item.currency || item.code || "").toUpperCase(),
-        balance: item.balance ?? item.amount ?? item.available ?? item.freeBalance
-      }))
-      .filter((x) => x.asset);
-  }
-
-  function isKnownAsset(val) {
-    return typeof val === "string" && DEFAULT_ASSETS.includes(val.toUpperCase());
-  }
-
-  function detectPageAsset() {
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        const val = localStorage.getItem(key);
-        if (!val) continue;
-        if (/asset|currency|wallet/i.test(key) && isKnownAsset(val)) {
-          return val.toUpperCase();
-        }
-        try {
-          const j = JSON.parse(val);
-          const a = j?.asset || j?.selectedAsset || j?.activeAsset || j?.currency;
-          if (isKnownAsset(a)) return a.toUpperCase();
-        } catch (_) {}
-      }
-    } catch (_) {}
-
-    try {
-      const nodes = document.querySelectorAll(
-        "[data-asset], [data-currency], [data-symbol], [class*='asset'], [class*='currency']"
-      );
-      for (const node of nodes) {
-        const raw = node.dataset.asset || node.dataset.currency || node.dataset.symbol
-          || node.textContent?.trim();
-        if (isKnownAsset(raw)) return raw.toUpperCase();
-      }
-    } catch (_) {}
-
-    return null;
-  }
-
-  function syncPageAsset() {
-    const detected = detectPageAsset();
-    if (!detected) return false;
-    if (detected !== cfg.asset) {
-      cfg.asset = detected;
-      liveBalance = null;
-      fetchLiveBalance();
+  async function waitForAsset(maxMs = 12000) {
+    const start = Date.now();
+    while (!cfg.asset && Date.now() - start < maxMs) {
+      await forceFetchPrimaryAsset();
+      if (cfg.asset) return;
+      await sleep(400);
     }
-    updateLiveBalanceDisplay();
-    return true;
-  }
-
-  function updateLiveBalanceDisplay() {
-    const assetEl = document.getElementById("dg-live-asset");
-    const balEl = document.getElementById("dg-live-balance");
-    if (assetEl) assetEl.textContent = cfg.asset;
-    if (balEl) {
-      balEl.textContent = liveBalance != null
-        ? `${formatBalance(liveBalance)} ${cfg.asset}`
-        : "…";
-    }
-  }
-
-  async function fetchLiveBalance() {
-    const paths = ["/wallet/balances", "/wallets", "/user/balances", "/balances"];
-    for (const path of paths) {
-      try {
-        const data = await apiGet(path);
-        const list = parseAssetList(data);
-        const match = list.find((x) => x.asset === cfg.asset);
-        if (match?.balance != null) {
-          liveBalance = parseFloat(match.balance);
-          updateLiveBalanceDisplay();
-          return;
-        }
-      } catch (_) {}
-    }
-  }
-
-  function startBalanceSync() {
-    syncPageAsset();
-    fetchLiveBalance();
-    if (balanceSyncTimer) clearInterval(balanceSyncTimer);
-    balanceSyncTimer = setInterval(() => {
-      syncPageAsset();
-      if (!running) fetchLiveBalance();
-    }, 3000);
   }
 
   async function runLoop() {
     if (running) return;
-    syncPageAsset();
-    if (liveBalance == null) await fetchLiveBalance();
+    readForm();
+    setStatus("Détection crypto…");
+    await forceFetchPrimaryAsset();
+    if (!cfg.asset) await waitForAsset();
+    if (!cfg.asset) {
+      setStatus("Crypto introuvable — connecte-toi sur Degen");
+      return;
+    }
     running = true;
     abort = false;
+    baseBetAmount = cfg.betAmount;
     setStatus("En cours…");
 
     const betFn = betFns[cfg.game];
@@ -379,7 +766,13 @@
       return;
     }
 
-    const delay = Math.max(MIN_DELAY, cfg.delayMs);
+    if (cfg.game === "mines") {
+      await closeActiveMinesGame();
+    }
+
+    const delay = cfg.game === "mines"
+      ? Math.max(200, cfg.delayMs)
+      : Math.max(MIN_DELAY, cfg.delayMs);
 
     try {
       while (!abort) {
@@ -389,10 +782,9 @@
           const data = await betFn();
           recordResult(data);
           updateStats();
-          const detail = data.minesDetail ?? data.rollResult ?? data.resultMultiplier
-            ?? (data.matches != null ? `${data.matches} match(es) ×${data.payoutMultiplier}` : null)
-            ?? "—";
-          setStatus(`#${stats.bets} → ${data.status} (${detail})`);
+          const detail = getBetDetail(data);
+          setStatus(`#${stats.bets} → ${data.status} (${detail}) | mise ${cfg.betAmount}`);
+          if (checkStopLimits()) break;
         } catch (e) {
           if (e.status === 429) {
             setStatus("Rate limit — pause 2s");
@@ -402,6 +794,12 @@
           if (e.status === 403) {
             setStatus("Non connecté ou session expirée");
             break;
+          }
+          if (e.status === 400 && cfg.game === "mines") {
+            setStatus("Mines: " + e.message + " — cashout…");
+            await recoverMinesFromError(e);
+            await sleep(500);
+            continue;
           }
           setStatus("Erreur: " + e.message);
           log(e);
@@ -431,7 +829,6 @@
   }
 
   function readForm() {
-    syncPageAsset();
     cfg.game = document.getElementById("dg-game").value;
     cfg.betAmount = document.getElementById("dg-bet").value.trim();
     cfg.delayMs = parseInt(document.getElementById("dg-delay").value, 10) || MIN_DELAY;
@@ -447,8 +844,14 @@
     cfg.minesCount = parseInt(document.getElementById("dg-mines-count").value, 10) || 3;
     cfg.minesReveals = parseInt(document.getElementById("dg-mines-reveals").value, 10) || 1;
     cfg.minesTiles = document.getElementById("dg-mines-tiles").value.trim();
+    cfg.winMode = getModeValue("win");
+    cfg.winPct = parseFloat(document.getElementById("dg-win-pct").value) || 0;
+    cfg.lossMode = getModeValue("loss");
+    cfg.lossPct = parseFloat(document.getElementById("dg-loss-pct").value) || 0;
+    cfg.stopProfit = parseFloat(document.getElementById("dg-stop-profit").value) || 0;
+    cfg.stopLoss = parseFloat(document.getElementById("dg-stop-loss").value) || 0;
     save();
-    updateLiveBalanceDisplay();
+    refreshReadyStatus();
     updateStats();
     toggleGameFields();
   }
@@ -510,6 +913,16 @@
     document.getElementById("dg-plinko-fields").style.display = g === "plinko" ? "block" : "none";
     document.getElementById("dg-keno-fields").style.display = g === "keno" ? "block" : "none";
     document.getElementById("dg-mines-fields").style.display = g === "mines" ? "block" : "none";
+    const cashoutBtn = document.getElementById("dg-cashout");
+    if (cashoutBtn) cashoutBtn.style.display = g === "mines" ? "block" : "none";
+  }
+
+  async function manualMinesCashout() {
+    if (running) return;
+    setStatus("Recherche partie Mines…");
+    const ok = await closeActiveMinesGame();
+    setStatus(ok ? "Cashout OK" : "Aucune partie Mines active");
+    refreshReadyStatus();
   }
 
   function buildUI() {
@@ -528,7 +941,7 @@
         padding: 10px 12px; background: #1a1a22; border-radius: 10px 10px 0 0;
         cursor: move; user-select: none; font-weight: 600; font-size: 13px;
       }
-      #degen-turbo-panel .dg-body { padding: 10px 12px; }
+      #degen-turbo-panel .dg-body { padding: 10px 12px; max-height: 75vh; overflow-y: auto; }
       #degen-turbo-panel label { display: block; margin: 6px 0 3px; color: #999; font-size: 11px; }
       #degen-turbo-panel input, #degen-turbo-panel select {
         width: 100%; padding: 6px 8px; background: #0d0d10; border: 1px solid #333;
@@ -544,20 +957,82 @@
       #dg-start { background: #22c55e; color: #000; }
       #dg-stop { background: #ef4444; color: #fff; }
       #dg-reset { background: #333; color: #ccc; flex: 0 0 auto; padding: 8px 10px; }
+      #dg-cashout { background: #ca8a04; color: #000; flex: 0 0 auto; padding: 8px 10px; }
       #dg-status { margin-top: 8px; font-size: 11px; color: #888; min-height: 16px; }
-      #dg-stats { margin-top: 4px; font-size: 11px; color: #6ee7b7; }
+      #dg-stats { margin-top: 4px; font-size: 11px; color: #6ee7b7; flex: 1; }
+      #degen-turbo-panel .dg-stats-row {
+        display: flex; align-items: center; gap: 6px; margin-top: 4px;
+      }
+      #degen-turbo-panel #dg-history-btn {
+        flex: 0 0 auto; padding: 4px 8px; background: #2a2a35; color: #ccc;
+        border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 11px;
+      }
+      #degen-turbo-panel #dg-history-btn:hover { background: #333; color: #fff; }
+      #dg-history-modal {
+        display: none; position: fixed; inset: 0; z-index: 1000001;
+        background: rgba(0,0,0,.65); align-items: center; justify-content: center;
+      }
+      #dg-history-modal.dg-open { display: flex; }
+      #dg-history-modal .dg-modal-box {
+        width: 320px; max-height: 80vh; display: flex; flex-direction: column;
+        background: #14141a; border: 1px solid #2a2a35; border-radius: 10px;
+        color: #e8e8ef; font: 11px/1.4 "Work Sans", sans-serif;
+        box-shadow: 0 12px 40px rgba(0,0,0,.6);
+      }
+      #dg-history-modal .dg-modal-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 8px 10px; background: #1a1a22; border-radius: 10px 10px 0 0; font-weight: 600;
+      }
+      #dg-history-modal .dg-modal-close {
+        background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 0 4px;
+      }
+      #dg-history-modal .dg-modal-body { padding: 10px; overflow: hidden; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+      #dg-history-modal .dg-modal-hint { margin: 0 0 8px; color: #888; font-size: 10px; }
+      #dg-history-summary { font-size: 10px; color: #888; margin: 0 0 8px; }
+      #dg-history-modal .dg-hist-filters { display: flex; gap: 4px; margin-bottom: 8px; }
+      #dg-history-modal .dg-hist-filter {
+        flex: 1; padding: 5px; background: #0d0d10; border: 1px solid #333;
+        border-radius: 6px; color: #888; font-size: 10px; cursor: pointer;
+      }
+      #dg-history-modal .dg-hist-filter.dg-active { background: #e8e8ef; color: #000; border-color: #e8e8ef; font-weight: 600; }
+      #dg-history-list { overflow-y: auto; flex: 1; max-height: 340px; }
+      #dg-history-modal .dg-hist-item {
+        padding: 8px; margin-bottom: 4px; background: #0d0d10; border: 1px solid #2a2a35;
+        border-radius: 6px; font-size: 10px;
+      }
+      #dg-history-modal .dg-hist-item.dg-hist-big { border-color: #ca8a04; background: #1a1508; }
+      #dg-history-modal .dg-hist-top { display: flex; justify-content: space-between; color: #aaa; margin-bottom: 3px; }
+      #dg-history-modal .dg-hist-detail { color: #ccc; margin-bottom: 4px; }
+      #dg-history-modal .dg-hist-bottom { display: flex; justify-content: space-between; gap: 6px; color: #888; }
+      #dg-history-modal .dg-hist-pos { color: #6ee7b7; font-weight: 600; }
+      #dg-history-modal .dg-hist-neg { color: #f87171; font-weight: 600; }
+      #dg-history-modal .dg-hist-empty { text-align: center; color: #666; padding: 20px; font-size: 11px; }
+      #dg-history-modal .dg-modal-foot {
+        display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid #2a2a35;
+      }
+      #dg-history-modal .dg-modal-foot button {
+        flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; cursor: pointer;
+      }
+      #dg-history-clear { background: #333; color: #ccc; }
+      #dg-history-close-btn { background: #2a2a35; color: #e8e8ef; }
       #degen-turbo-panel .dg-close {
         background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 0 4px;
       }
       #degen-turbo-panel .dg-fields { margin-top: 4px; }
-      #degen-turbo-panel .dg-wallet {
-        display: flex; justify-content: space-between; align-items: center;
-        margin: 8px 0 4px; padding: 8px 10px; background: #0d0d10;
-        border: 1px solid #2a2a35; border-radius: 6px;
+      #degen-turbo-panel .dg-auto { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2a35; }
+      #degen-turbo-panel .dg-auto-title { font-size: 11px; font-weight: 600; color: #ccc; margin-bottom: 6px; }
+      #degen-turbo-panel .dg-mode-row { display: flex; gap: 4px; align-items: center; margin-bottom: 8px; }
+      #degen-turbo-panel .dg-mode-btn {
+        flex: 1; padding: 6px 4px; background: #0d0d10; border: 1px solid #333;
+        border-radius: 6px; color: #888; font-size: 10px; cursor: pointer;
       }
-      #degen-turbo-panel .dg-wallet-label { color: #888; font-size: 10px; }
-      #degen-turbo-panel .dg-wallet-value { font-size: 12px; font-weight: 600; color: #e8e8ef; }
-      #dg-live-balance { font-size: 13px; font-weight: 700; color: #6ee7b7; }
+      #degen-turbo-panel .dg-mode-btn.dg-active { background: #e8e8ef; color: #000; border-color: #e8e8ef; font-weight: 600; }
+      #degen-turbo-panel .dg-mode-pct { display: flex; gap: 4px; align-items: center; flex: 1; min-width: 0; }
+      #degen-turbo-panel .dg-mode-pct input { flex: 1; min-width: 0; padding: 6px 4px; text-align: right; }
+      #degen-turbo-panel .dg-mode-pct span { color: #666; font-size: 10px; flex-shrink: 0; }
+      #degen-turbo-panel .dg-stop-row { margin-bottom: 8px; }
+      #degen-turbo-panel .dg-stop-head { display: flex; justify-content: space-between; font-size: 10px; color: #888; margin-bottom: 3px; }
+      #degen-turbo-panel .dg-btns button { pointer-events: auto; position: relative; z-index: 1; }
       #degen-turbo-panel .dg-label-row {
         display: flex; align-items: center; justify-content: space-between; margin: 6px 0 3px;
       }
@@ -619,17 +1094,6 @@
           <option value="mines">Mines</option>
         </select>
 
-        <div class="dg-wallet">
-          <div>
-            <div class="dg-wallet-label">Crypto (site)</div>
-            <div class="dg-wallet-value" id="dg-live-asset">—</div>
-          </div>
-          <div style="text-align:right">
-            <div class="dg-wallet-label">Solde temps réel</div>
-            <div id="dg-live-balance">…</div>
-          </div>
-        </div>
-
         <label>Mise</label>
         <input id="dg-bet" type="text" value="${cfg.betAmount}" />
 
@@ -641,6 +1105,39 @@
           <div>
             <label>Max paris (0=∞)</label>
             <input id="dg-max" type="number" min="0" value="${cfg.maxBets}" />
+          </div>
+        </div>
+
+        <div class="dg-auto">
+          <div class="dg-auto-title">Configurer automatiquement</div>
+
+          <label>Sur victoire</label>
+          <div class="dg-mode-row">
+            <button type="button" class="dg-mode-btn dg-active" data-group="win" data-value="reset">Réinitialiser</button>
+            <div class="dg-mode-pct">
+              <button type="button" class="dg-mode-btn" data-group="win" data-value="increase">Augmenté de</button>
+              <input id="dg-win-pct" type="number" min="0" step="0.01" value="${cfg.winPct}" disabled />
+              <span>%</span>
+            </div>
+          </div>
+
+          <label>En cas de perte</label>
+          <div class="dg-mode-row">
+            <button type="button" class="dg-mode-btn dg-active" data-group="loss" data-value="reset">Réinitialiser</button>
+            <div class="dg-mode-pct">
+              <button type="button" class="dg-mode-btn" data-group="loss" data-value="increase">Augmenté de</button>
+              <input id="dg-loss-pct" type="number" min="0" step="0.01" value="${cfg.lossPct}" disabled />
+              <span>%</span>
+            </div>
+          </div>
+
+          <div class="dg-stop-row">
+            <div class="dg-stop-head"><span>Arrêtez sur le profit</span><span id="dg-stop-profit-hint">0 = désactivé</span></div>
+            <input id="dg-stop-profit" type="number" min="0" step="any" value="${cfg.stopProfit}" placeholder="0" />
+          </div>
+          <div class="dg-stop-row">
+            <div class="dg-stop-head"><span>Arrêt en cas de perte</span><span id="dg-stop-loss-hint">0 = désactivé</span></div>
+            <input id="dg-stop-loss" type="number" min="0" step="any" value="${cfg.stopLoss}" placeholder="0" />
           </div>
         </div>
 
@@ -727,10 +1224,14 @@
         <div class="dg-btns">
           <button id="dg-start">▶ Start</button>
           <button id="dg-stop">■ Stop</button>
+          <button id="dg-cashout" title="Cashout partie Mines active" style="display:none">💰</button>
           <button id="dg-reset" title="Reset stats">↺</button>
         </div>
-        <div id="dg-status">Prêt — connecte-toi sur Degen</div>
-        <div id="dg-stats">Paris: 0 | W: 0 L: 0 | P/L: 0</div>
+        <div id="dg-status">Prêt</div>
+        <div class="dg-stats-row">
+          <div id="dg-stats">Paris: 0 | W: 0 L: 0 | P/L: 0</div>
+          <button type="button" id="dg-history-btn" title="Historique des paris">📜</button>
+        </div>
       </div>
     `;
 
@@ -753,19 +1254,60 @@
     `;
     document.body.appendChild(modal);
 
+    const histModal = document.createElement("div");
+    histModal.id = "dg-history-modal";
+    histModal.innerHTML = `
+      <div class="dg-modal-box">
+        <div class="dg-modal-head">
+          <span>📜 Historique</span>
+          <button type="button" class="dg-modal-close" id="dg-history-modal-close">×</button>
+        </div>
+        <div class="dg-modal-body">
+          <p class="dg-modal-hint" id="dg-history-summary">0 paris</p>
+          <div class="dg-hist-filters">
+            <button type="button" class="dg-hist-filter dg-active" data-filter="all">Tous</button>
+            <button type="button" class="dg-hist-filter" data-filter="big">🔥 Gros gains (×${BIG_WIN_MULT}+)</button>
+          </div>
+          <div id="dg-history-list"></div>
+        </div>
+        <div class="dg-modal-foot">
+          <button type="button" id="dg-history-clear">Vider</button>
+          <button type="button" id="dg-history-close-btn">Fermer</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(histModal);
+
     document.getElementById("dg-game").value = cfg.game;
     document.getElementById("dg-dice-type").value = cfg.diceType;
     document.getElementById("dg-plinko-risk").value = cfg.plinkoRisk;
     document.getElementById("dg-keno-variant").value = cfg.kenoVariant;
     document.getElementById("dg-keno-risk").value = cfg.kenoRisk;
     toggleGameFields();
+    setModeValue("win", cfg.winMode);
+    setModeValue("loss", cfg.lossMode);
+    refreshReadyStatus();
+    updateStats();
+    startAssetSync();
 
-    document.getElementById("dg-start").onclick = () => { readForm(); runLoop(); };
+    document.querySelectorAll(".dg-mode-btn").forEach((btn) => {
+      btn.onclick = () => {
+        const group = btn.dataset.group;
+        if (!group) return;
+        setModeValue(group, btn.dataset.value);
+        readForm();
+      };
+    });
+    ["dg-win-pct", "dg-loss-pct", "dg-stop-profit", "dg-stop-loss"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("change", () => readForm());
+    });
+
+    document.getElementById("dg-start").onclick = () => runLoop();
     document.getElementById("dg-stop").onclick = stop;
+    document.getElementById("dg-cashout").onclick = () => manualMinesCashout();
     document.getElementById("dg-reset").onclick = resetStats;
     document.getElementById("dg-close").onclick = () => { panel.style.display = "none"; };
     document.getElementById("dg-game").onchange = () => { readForm(); };
-    startBalanceSync();
 
     document.getElementById("dg-mines-schema-btn").onclick = openMinesModal;
     document.getElementById("dg-mines-modal-close").onclick = closeMinesModal;
@@ -775,11 +1317,27 @@
     });
     document.getElementById("dg-mines-tiles").oninput = updateMinesModalHighlight;
 
+    document.getElementById("dg-history-btn").onclick = openHistoryModal;
+    document.getElementById("dg-history-modal-close").onclick = closeHistoryModal;
+    document.getElementById("dg-history-close-btn").onclick = closeHistoryModal;
+    document.getElementById("dg-history-clear").onclick = clearHistory;
+    histModal.onclick = (e) => { if (e.target === histModal) closeHistoryModal(); };
+    histModal.querySelectorAll(".dg-hist-filter").forEach((btn) => {
+      btn.onclick = () => {
+        historyFilter = btn.dataset.filter || "all";
+        histModal.querySelectorAll(".dg-hist-filter").forEach((b) => {
+          b.classList.toggle("dg-active", b.dataset.filter === historyFilter);
+        });
+        renderHistory();
+      };
+    });
+    renderHistory();
+
     // drag
     const head = panel.querySelector(".dg-head");
     let ox, oy, dragging = false;
     head.onmousedown = (e) => {
-      if (e.target.id === "dg-close") return;
+      if (e.target.closest("button")) return;
       dragging = true;
       ox = e.clientX - panel.offsetLeft;
       oy = e.clientY - panel.offsetTop;
@@ -802,8 +1360,12 @@
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", buildUI);
+    document.addEventListener("DOMContentLoaded", () => {
+      buildUI();
+      forceFetchPrimaryAsset();
+    });
   } else {
     buildUI();
+    forceFetchPrimaryAsset();
   }
 })();

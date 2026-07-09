@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.9.0
+// @version      1.10.3
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -20,10 +20,10 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.9.0";
+  const SCRIPT_VERSION = "1.10.3";
   const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
   const KENO_LIMITS = { keno_40: 40, keno_50: 50, keno_60: 60, keno_70: 70, keno_80: 80 };
-  const MINES_STEP_MS = 50; // pause entre appels Mines (start/reveal/cashout)
+  // Mines = start + reveal(s) + cashout : pas de pause interne, seul le Délai entre manches compte
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
   const KNOWN_SET = new Set(KNOWN_ASSETS);
   const HISTORY_MAX = 300;
@@ -157,17 +157,91 @@
     return syncAssetFromCache();
   }
 
+  let lastMinesGameId = GM_getValue("dg_mines_game_id", "") || null;
+  let minesLock = Promise.resolve();
+
+  function isValidGameId(id) {
+    return typeof id === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+  }
+
+  function saveMinesState(game) {
+    if (!isValidGameId(game?.id)) return;
+    GM_setValue("dg_mines_state", JSON.stringify({
+      id: game.id,
+      status: game.status,
+      revealedTiles: game.revealedTiles || []
+    }));
+  }
+
+  function loadMinesState(gameId) {
+    try {
+      const s = JSON.parse(GM_getValue("dg_mines_state", "{}"));
+      if (s?.id === gameId) return s;
+    } catch (_) {}
+    return null;
+  }
+
+  function clearMinesState() {
+    GM_setValue("dg_mines_state", "");
+  }
+
+  function setLastMinesGameId(id) {
+    const next = isValidGameId(id) ? id : null;
+    lastMinesGameId = next;
+    GM_setValue("dg_mines_game_id", next || "");
+    if (!next) clearMinesState();
+  }
+
+  if (!isValidGameId(lastMinesGameId)) setLastMinesGameId(null);
+
+  function captureMinesFromJson(data, url) {
+    if (!data || typeof data !== "object") return;
+    const path = url || "";
+    if (isValidGameId(data.id)) {
+      if (data.status === "ACTIVE" || /\/start|\/reveal/.test(path)) {
+        setLastMinesGameId(data.id);
+        saveMinesState(data);
+      }
+      if (/cashout/.test(path) && data.status === "COMPLETED") {
+        setLastMinesGameId(null);
+      }
+    }
+    if (isValidGameId(data.gameId)) setLastMinesGameId(data.gameId);
+    if (data.game && isValidGameId(data.game.id)) setLastMinesGameId(data.game.id);
+    if (Array.isArray(data)) {
+      const active = data.find((g) => g?.status === "ACTIVE" && isValidGameId(g.id));
+      if (active) setLastMinesGameId(active.id);
+    }
+  }
+
+  function captureMinesFromRequest(body) {
+    if (!body) return;
+    try {
+      const parsed = typeof body === "string" ? JSON.parse(body) : body;
+      if (isValidGameId(parsed?.gameId)) setLastMinesGameId(parsed.gameId);
+    } catch (_) {}
+  }
+
   function installAssetHooks() {
     const origFetch = WIN.fetch;
     if (!origFetch._dgAssetHooked) {
       WIN.fetch = async function (input, init) {
         const url = typeof input === "string" ? input : input?.url || "";
         const isBalance = /\/balance\/primary/.test(url);
+        const isMines = /\/games\/mines/.test(url);
+        if (isMines && init?.body) captureMinesFromRequest(init.body);
         const res = await origFetch.apply(this, arguments);
         if (isBalance && res.ok) {
           try {
             const data = await res.clone().json();
             resolveAssetFromBalance(data);
+          } catch (_) {}
+        }
+        if (isMines) {
+          try {
+            const data = await res.clone().json();
+            captureMinesFromJson(data, url);
           } catch (_) {}
         }
         return res;
@@ -182,13 +256,23 @@
         this._dgUrl = String(url || "");
         return origOpen.apply(this, arguments);
       };
-      XMLHttpRequest.prototype.send = function () {
+      XMLHttpRequest.prototype.send = function (body) {
+        const url = this._dgUrl || "";
+        if (/\/games\/mines/.test(url)) captureMinesFromRequest(body);
         this.addEventListener("load", function () {
-          if (!/\/balance\/primary/.test(this._dgUrl || "")) return;
-          if (this.status < 200 || this.status >= 300) return;
+          if (/\/balance\/primary/.test(this._dgUrl || "")) {
+            if (this.status >= 200 && this.status < 300) {
+              try {
+                const data = JSON.parse(this.responseText);
+                resolveAssetFromBalance(data);
+              } catch (_) {}
+            }
+            return;
+          }
+          if (!/\/games\/mines/.test(this._dgUrl || "")) return;
           try {
             const data = JSON.parse(this.responseText);
-            resolveAssetFromBalance(data);
+            captureMinesFromJson(data, this._dgUrl);
           } catch (_) {}
         });
         return origSend.apply(this, arguments);
@@ -209,7 +293,6 @@
   let running = false;
   let abort = false;
   let baseBetAmount = cfg.betAmount;
-  let lastMinesGameId = null;
 
   function startAssetSync() {
     const tick = () => autoDetectAsset().then(() => {
@@ -307,6 +390,7 @@
     const m = data.message;
     if (typeof m === "string") return m;
     if (m && typeof m.message === "string") return m.message;
+    if (m && Array.isArray(m.message)) return m.message.join(", ");
     if (Array.isArray(data.messages)) return data.messages.join(", ");
     if (typeof data.messages === "string") return data.messages;
     if (m && typeof m === "object") {
@@ -444,139 +528,163 @@
 
   function normalizeMinesResult(game, hitMine) {
     const payout = parseFloat(game.finalPayout || game.winAmount || 0) || 0;
+    const bet = parseAmount(game.betAmount || cfg.betAmount);
     const mult = game.currentMultiplier || "1";
+    const revealed = (game.revealedTiles || []).length;
+    let status;
+    if (hitMine || game.status === "LOST") status = "LOST";
+    else if (game.status === "COMPLETED") status = payout >= bet ? "WON" : "COMPLETED";
+    else if (payout > bet) status = "WON";
+    else status = "LOST";
     return {
-      betAmount: game.betAmount,
+      betAmount: game.betAmount || cfg.betAmount,
       winAmount: String(payout),
-      status: hitMine ? "LOST" : payout > 0 ? "WON" : game.status,
+      status,
       minesDetail: hitMine
         ? `mine! (×${mult})`
-        : `${(game.revealedTiles || []).length} gem(s) ×${mult}`
+        : `${revealed} gem(s) ×${mult}`
     };
   }
 
-  function extractGameIdFromError(data) {
-    if (!data) return null;
-    if (data.id) return data.id;
-    if (data.gameId) return data.gameId;
-    if (data.game?.id) return data.game.id;
-    const m = data.message;
-    if (m?.gameId) return m.gameId;
-    if (m?.id) return m.id;
-    try {
-      const hit = JSON.stringify(data).match(/"gameId"\s*:\s*"([^"]+)"/);
-      return hit?.[1] || null;
-    } catch (_) {
-      return null;
-    }
+  function minesStartPayload() {
+    return {
+      betAmount: formatBetAmount(cfg.betAmount),
+      minesCount: cfg.minesCount,
+      gameSessionId: uuid()
+    };
   }
 
-  async function cashoutMinesGame(gameId) {
-    if (!gameId) return false;
+  function minesRevealPayload(gameId, tilePosition) {
+    return {
+      gameId,
+      tilePosition: Number(tilePosition)
+    };
+  }
+
+  function minesCashoutPayload(gameId) {
+    return { gameId };
+  }
+
+  function isActiveMinesError(err) {
+    const parts = [err?.message, err?.data?.message];
     try {
-      await api("/games/mines/cashout", { gameId });
-      await sleep(MINES_STEP_MS);
-      return true;
-    } catch (e) {
-      log("Cashout échoué:", e.message);
+      parts.push(JSON.stringify(err?.data || ""));
+    } catch (_) {}
+    const text = parts.flat().join(" ").toLowerCase();
+    return /active mines game|already have an active|partie mines active/.test(text);
+  }
+
+  function isInvalidUuidError(err) {
+    try {
+      return /invalid_uuid/.test(JSON.stringify(err?.data || err?.message || ""));
+    } catch (_) {
       return false;
     }
   }
 
-  async function abandonMinesGame(gameId) {
-    if (!gameId) return false;
-    const paths = ["/games/mines/abandon", "/games/mines/forfeit", "/games/mines/cancel"];
-    for (const path of paths) {
-      try {
-        await api(path, { gameId });
-        await sleep(MINES_STEP_MS);
-        return true;
-      } catch (_) {}
+  async function cashoutMinesGame(gameId) {
+    if (!isValidGameId(gameId)) return false;
+    try {
+      await api("/games/mines/cashout", minesCashoutPayload(gameId));
+      setLastMinesGameId(null);
+      return true;
+    } catch (e) {
+      log("Cashout échoué:", e.message, gameId);
+      if (isInvalidUuidError(e)) setLastMinesGameId(null);
+      return false;
     }
-    return false;
+  }
+
+  async function forceCloseActiveMines() {
+    if (!isValidGameId(lastMinesGameId)) return false;
+    return cashoutMinesGame(lastMinesGameId);
   }
 
   async function closeActiveMinesGame(quiet) {
-    if (!lastMinesGameId) return false;
     if (!quiet) setStatus("Cashout partie Mines…");
-    const gameId = lastMinesGameId;
-    if (await cashoutMinesGame(gameId)) {
-      lastMinesGameId = null;
-      if (!quiet) setStatus("Cashout OK");
-      return true;
-    }
-    if (await abandonMinesGame(gameId)) {
-      lastMinesGameId = null;
-      if (!quiet) setStatus("Partie Mines fermée");
-      return true;
-    }
-    return false;
+    const ok = await forceCloseActiveMines();
+    if (ok && !quiet) setStatus("Partie Mines fermée");
+    return ok;
   }
 
-  async function recoverMinesFromError(err) {
-    const gameId = extractGameIdFromError(err?.data) || lastMinesGameId;
-    if (!gameId) return false;
-    if (await cashoutMinesGame(gameId)) {
-      lastMinesGameId = null;
-      return true;
-    }
-    if (await abandonMinesGame(gameId)) {
-      lastMinesGameId = null;
-      return true;
-    }
-    return false;
-  }
-
-  async function minesStart(payload) {
-    try {
-      const game = await api("/games/mines/start", payload);
-      lastMinesGameId = game.id || null;
-      return game;
-    } catch (e) {
-      if (e.status !== 400) throw e;
-      log("Mines start 400 — récupération…", e.data);
-      await recoverMinesFromError(e);
-      await sleep(400);
-      const game = await api("/games/mines/start", payload);
-      lastMinesGameId = game.id || null;
-      return game;
-    }
-  }
-
-  async function betMines() {
-    const fixedTiles = parseMinesTiles();
-    const reveals = Math.max(1, Math.min(cfg.minesReveals, MINES_GRID - cfg.minesCount));
-
-    let game = await minesStart(betBody({
-      betAmount: cfg.betAmount,
-      minesCount: cfg.minesCount,
-      gameSessionId: uuid()
-    }));
-
-    for (let i = 0; i < reveals; i++) {
+  async function playMinesRound(game, fixedTiles, reveals, skipReveals = 0) {
+    for (let i = skipReveals; i < reveals; i++) {
       if (game.status !== "ACTIVE") break;
 
-      await sleep(MINES_STEP_MS);
       const tile = fixedTiles[i] ?? pickMinesTile(game.revealedTiles || []);
-      game = await api("/games/mines/reveal", {
-        gameId: game.id,
-        tilePosition: tile
-      });
+      game = await api("/games/mines/reveal", minesRevealPayload(game.id, tile));
+      saveMinesState(game);
 
       if (game.status !== "ACTIVE") {
-        lastMinesGameId = null;
+        setLastMinesGameId(null);
         return normalizeMinesResult(game, true);
       }
     }
 
     if (game.status === "ACTIVE") {
-      await sleep(MINES_STEP_MS);
-      game = await api("/games/mines/cashout", { gameId: game.id });
+      if (!isValidGameId(game.id)) throw new Error("Mines cashout sans gameId");
+      game = await api("/games/mines/cashout", minesCashoutPayload(game.id));
+      setLastMinesGameId(null);
     }
 
-    lastMinesGameId = null;
-    await sleep(MINES_STEP_MS);
     return normalizeMinesResult(game, false);
+  }
+
+  async function finishMinesGame(gameId, fixedTiles, reveals) {
+    if (!isValidGameId(gameId)) {
+      throw new Error("Partie Mines active — clique 💰 ou cashout sur Degen");
+    }
+
+    const saved = loadMinesState(gameId);
+    let game = saved
+      ? { id: gameId, status: saved.status || "ACTIVE", revealedTiles: saved.revealedTiles || [] }
+      : { id: gameId, status: "ACTIVE", revealedTiles: [] };
+
+    const already = (game.revealedTiles || []).length;
+    const skipReveals = Math.min(already, reveals);
+
+    if (game.status === "ACTIVE" && skipReveals >= reveals) {
+      game = await api("/games/mines/cashout", minesCashoutPayload(gameId));
+      setLastMinesGameId(null);
+      return normalizeMinesResult(game, false);
+    }
+
+    return playMinesRound(game, fixedTiles, reveals, skipReveals);
+  }
+
+  async function betMinesOnce() {
+    const fixedTiles = parseMinesTiles();
+    const reveals = Math.max(1, Math.min(cfg.minesReveals, MINES_GRID - cfg.minesCount));
+
+    if (isValidGameId(lastMinesGameId)) {
+      setStatus("Mines: finition partie en cours…");
+      return finishMinesGame(lastMinesGameId, fixedTiles, reveals);
+    }
+
+    let game = null;
+    try {
+      game = await api("/games/mines/start", minesStartPayload());
+      if (!isValidGameId(game?.id)) throw new Error("Mines: start sans gameId");
+      setLastMinesGameId(game.id);
+      saveMinesState(game);
+      return await playMinesRound(game, fixedTiles, reveals);
+    } catch (e) {
+      if (e.status === 400 && isActiveMinesError(e)) {
+        if (isValidGameId(lastMinesGameId)) {
+          setStatus("Mines: partie active — finition…");
+          return finishMinesGame(lastMinesGameId, fixedTiles, reveals);
+        }
+        throw new Error("Partie Mines active — clique 💰 ou cashout sur Degen");
+      }
+      if (isValidGameId(game?.id)) await cashoutMinesGame(game.id);
+      throw e;
+    }
+  }
+
+  async function betMines() {
+    const run = minesLock.then(() => betMinesOnce());
+    minesLock = run.catch(() => {});
+    return run;
   }
 
   const betFns = {
@@ -594,6 +702,34 @@
     if (Math.abs(v) < 0.0001) return v.toFixed(8);
     if (Math.abs(v) < 1) return v.toFixed(6);
     return v.toFixed(4);
+  }
+
+  const GAME_LABELS = {
+    dice: "🎲 Dice",
+    limbo: "🚀 Limbo",
+    plinko: "📍 Plinko",
+    keno: "🎯 Keno",
+    mines: "💣 Mines"
+  };
+
+  function getGameLabel(game) {
+    return GAME_LABELS[game] || game || "—";
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function formatHistoryTime(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    if (d.toDateString() === now.toDateString()) return time;
+    return `${d.toLocaleDateString([], { day: "2-digit", month: "2-digit" })} ${time}`;
   }
 
   function getBetDetail(data) {
@@ -629,38 +765,96 @@
     }
   }
 
+  function renderHistoryStats() {
+    const el = document.getElementById("dg-history-stats");
+    if (!el) return;
+
+    const wins = history.filter((h) => h.won).length;
+    const losses = history.length - wins;
+    const totalProfit = history.reduce((s, h) => s + h.profit, 0);
+    const asset = history[0]?.asset || cfg.asset || "";
+    const pnlClass = totalProfit >= 0 ? "dg-hist-pos" : "dg-hist-neg";
+    const pnlSign = totalProfit >= 0 ? "+" : "";
+
+    el.innerHTML = `
+      <div class="dg-hist-stat">
+        <span class="dg-hist-stat-val">${history.length}</span>
+        <span class="dg-hist-stat-lbl">Paris</span>
+      </div>
+      <div class="dg-hist-stat dg-hist-stat-win">
+        <span class="dg-hist-stat-val">${wins}</span>
+        <span class="dg-hist-stat-lbl">Gains</span>
+      </div>
+      <div class="dg-hist-stat dg-hist-stat-loss">
+        <span class="dg-hist-stat-val">${losses}</span>
+        <span class="dg-hist-stat-lbl">Pertes</span>
+      </div>
+      <div class="dg-hist-stat ${pnlClass}">
+        <span class="dg-hist-stat-val">${pnlSign}${formatAmt(totalProfit)}</span>
+        <span class="dg-hist-stat-lbl">P/L ${asset}</span>
+      </div>
+    `;
+  }
+
+  function filterHistoryItems() {
+    if (historyFilter === "big") return history.filter((h) => h.big);
+    if (historyFilter === "win") return history.filter((h) => h.won);
+    if (historyFilter === "loss") return history.filter((h) => !h.won);
+    return history;
+  }
+
+  function getHistoryEmptyMessage() {
+    if (historyFilter === "big") return "Aucun gros gain pour l'instant";
+    if (historyFilter === "win") return "Aucun gain enregistré";
+    if (historyFilter === "loss") return "Aucune perte enregistrée";
+    return "Aucun pari enregistré";
+  }
+
   function renderHistory() {
     const list = document.getElementById("dg-history-list");
-    const summary = document.getElementById("dg-history-summary");
     if (!list) return;
 
-    const items = historyFilter === "big" ? history.filter((h) => h.big) : history;
-    const bigCount = history.filter((h) => h.big).length;
-    const best = history.reduce((b, h) => (h.profit > 0 && (!b || h.profit > b.profit) ? h : b), null);
-
-    if (summary) {
-      summary.textContent = `${history.length} paris · ${bigCount} gros gains · Meilleur: +${best ? formatAmt(best.profit) : "0"} ${best?.asset || cfg.asset || ""}`;
-    }
+    renderHistoryStats();
+    const items = filterHistoryItems();
 
     if (!items.length) {
-      list.innerHTML = `<div class="dg-hist-empty">${historyFilter === "big" ? "Aucun gros gain" : "Aucun pari enregistré"}</div>`;
+      list.innerHTML = `
+        <div class="dg-hist-empty">
+          <div class="dg-hist-empty-icon">📭</div>
+          <div>${getHistoryEmptyMessage()}</div>
+        </div>`;
       return;
     }
 
-    list.innerHTML = items.map((h) => `
-      <div class="dg-hist-item ${h.big ? "dg-hist-big" : ""} ${h.won ? "dg-hist-win" : "dg-hist-loss"}">
-        <div class="dg-hist-top">
-          <span>#${h.id} · ${h.game} ${h.big ? "🔥" : ""}</span>
-          <span>${new Date(h.time).toLocaleTimeString()}</span>
+    list.innerHTML = items.map((h) => {
+      const profitClass = h.profit >= 0 ? "dg-hist-pos" : "dg-hist-neg";
+      const profitSign = h.profit >= 0 ? "+" : "";
+      const itemClass = [
+        "dg-hist-item",
+        h.won ? "dg-hist-win" : "dg-hist-loss",
+        h.big ? "dg-hist-big" : ""
+      ].filter(Boolean).join(" ");
+
+      return `
+      <div class="${itemClass}">
+        <div class="dg-hist-row1">
+          <span class="dg-hist-badge ${h.won ? "dg-badge-win" : "dg-badge-loss"}">${h.won ? "WIN" : "LOSS"}</span>
+          <span class="dg-hist-game">${getGameLabel(h.game)}</span>
+          <span class="dg-hist-num">#${h.id}</span>
+          ${h.big ? '<span class="dg-hist-fire">🔥</span>' : ""}
+          <span class="dg-hist-time">${formatHistoryTime(h.time)}</span>
         </div>
-        <div class="dg-hist-detail">${h.detail}</div>
-        <div class="dg-hist-bottom">
-          <span>Mise ${formatAmt(h.bet)}</span>
-          <span class="${h.profit >= 0 ? "dg-hist-pos" : "dg-hist-neg"}">${h.profit >= 0 ? "+" : ""}${formatAmt(h.profit)} ${h.asset}</span>
-          ${h.mult > 0 ? `<span>×${h.mult.toFixed(2)}</span>` : ""}
+        <div class="dg-hist-detail" title="${escapeHtml(h.detail)}">${escapeHtml(h.detail)}</div>
+        <div class="dg-hist-row3">
+          <div class="dg-hist-amounts">
+            <span><em>Mise</em> ${formatAmt(h.bet)}</span>
+            ${h.win > 0 ? `<span class="dg-hist-arrow">→</span><span><em>Gain</em> ${formatAmt(h.win)}</span>` : ""}
+            ${h.mult > 0 ? `<span class="dg-hist-mult">×${h.mult.toFixed(2)}</span>` : ""}
+          </div>
+          <span class="dg-hist-profit ${profitClass}">${profitSign}${formatAmt(h.profit)} <small>${h.asset}</small></span>
         </div>
-      </div>
-    `).join("");
+      </div>`;
+    }).join("");
   }
 
   function openHistoryModal() {
@@ -739,6 +933,30 @@
     log(msg);
   }
 
+  function updateRunButtons() {
+    const startBtn = document.getElementById("dg-start");
+    const stopBtn = document.getElementById("dg-stop");
+    if (!startBtn || !stopBtn) return;
+
+    if (running) {
+      startBtn.disabled = true;
+      startBtn.classList.add("dg-run-off");
+      startBtn.classList.remove("dg-run-on");
+      stopBtn.disabled = false;
+      stopBtn.classList.add("dg-run-on");
+      stopBtn.classList.remove("dg-run-off");
+      stopBtn.textContent = abort ? "■ Arrêt…" : "■ Stop";
+    } else {
+      startBtn.disabled = false;
+      startBtn.classList.add("dg-run-on");
+      startBtn.classList.remove("dg-run-off");
+      stopBtn.disabled = true;
+      stopBtn.classList.add("dg-run-off");
+      stopBtn.classList.remove("dg-run-on");
+      stopBtn.textContent = "■ Stop";
+    }
+  }
+
   function refreshReadyStatus() {
     if (assetConfirmed && cfg.asset) {
       setStatus(`Prêt — ${cfg.asset}`);
@@ -792,13 +1010,15 @@
     }
     running = true;
     abort = false;
+    updateRunButtons();
     baseBetAmount = formatBetAmount(cfg.betAmount);
     setStatus("En cours…");
 
     const betFn = betFns[cfg.game];
     if (!betFn) {
-      setStatus("Jeu inconnu");
       running = false;
+      updateRunButtons();
+      setStatus("Jeu inconnu");
       return;
     }
 
@@ -832,15 +1052,20 @@
             break;
           }
           if (e.status === 400) {
+            const minesErr = cfg.game === "mines" && (
+              isActiveMinesError(e) || isInvalidUuidError(e)
+              || /partie mines active|sans gameid/i.test(e.message || "")
+            );
+            if (minesErr) {
+              setStatus(e.message || "Mines: partie active");
+              log(e.path || cfg.game, e.data);
+              await sleep(1500);
+              continue;
+            }
             const hint = cfg.asset ? ` (${cfg.asset}, mise ${cfg.betAmount})` : "";
             setStatus("Bad request" + hint + ": " + e.message);
             log(e.path || cfg.game, e.data);
-            if (cfg.game === "mines") {
-              await recoverMinesFromError(e);
-              await sleep(500);
-            } else {
-              await sleep(1000);
-            }
+            await sleep(1000);
             continue;
           }
           setStatus("Erreur: " + e.message);
@@ -853,12 +1078,14 @@
       }
     } finally {
       running = false;
+      updateRunButtons();
       setStatus(abort ? "Arrêté" : "Terminé");
     }
   }
 
   function stop() {
     abort = true;
+    updateRunButtons();
     setStatus("Arrêt…");
   }
 
@@ -963,13 +1190,9 @@
 
   async function manualMinesCashout() {
     if (running) return;
-    if (!lastMinesGameId) {
-      setStatus("Aucune partie Mines en mémoire — relance le bot ou attends une erreur 400");
-      return;
-    }
     setStatus("Cashout partie Mines…");
-    const ok = await closeActiveMinesGame();
-    setStatus(ok ? "Cashout OK" : "Cashout impossible");
+    const ok = await forceCloseActiveMines();
+    setStatus(ok ? "Cashout OK" : "Pas de partie en mémoire — cashout sur Degen");
     refreshReadyStatus();
   }
 
@@ -1034,9 +1257,15 @@
       #degen-turbo-panel button {
         flex: 1; padding: 8px; border: none; border-radius: 6px;
         font-weight: 600; cursor: pointer; font-size: 12px;
+        transition: background 0.15s, color 0.15s, opacity 0.15s, box-shadow 0.15s, transform 0.08s;
       }
+      #degen-turbo-panel button:active:not(:disabled) { transform: scale(0.97); }
       #dg-start { background: #22c55e; color: #000; }
       #dg-stop { background: #ef4444; color: #fff; }
+      #dg-start.dg-run-on { background: #22c55e; color: #000; opacity: 1; box-shadow: 0 0 0 2px rgba(34,197,94,.35); }
+      #dg-start.dg-run-off { background: #1e2e24; color: #5a6b5f; opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+      #dg-stop.dg-run-on { background: #ef4444; color: #fff; opacity: 1; box-shadow: 0 0 0 2px rgba(239,68,68,.4); }
+      #dg-stop.dg-run-off { background: #2e1e1e; color: #6b5a5a; opacity: 0.55; cursor: not-allowed; box-shadow: none; }
       #dg-reset { background: #333; color: #ccc; flex: 0 0 auto; padding: 8px 10px; }
       #dg-cashout { background: #ca8a04; color: #000; flex: 0 0 auto; padding: 8px 10px; }
       #dg-status { margin-top: 8px; font-size: 11px; color: #888; min-height: 16px; }
@@ -1058,55 +1287,135 @@
       #degen-turbo-panel #dg-history-btn {
         flex: 0 0 auto; padding: 4px 8px; background: #2a2a35; color: #ccc;
         border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 11px;
+        transition: background 0.15s, color 0.15s;
       }
-      #degen-turbo-panel #dg-history-btn:hover { background: #333; color: #fff; }
+      #degen-turbo-panel #dg-history-btn:hover { background: #333; color: #fff; border-color: #555; }
       #dg-history-modal {
         display: none; position: fixed; inset: 0; z-index: 1000001;
-        background: rgba(0,0,0,.65); align-items: center; justify-content: center;
+        background: rgba(0,0,0,.7); align-items: center; justify-content: center;
+        padding: 12px;
       }
       #dg-history-modal.dg-open { display: flex; }
       #dg-history-modal .dg-modal-box {
-        width: 320px; max-height: 80vh; display: flex; flex-direction: column;
-        background: #14141a; border: 1px solid #2a2a35; border-radius: 10px;
-        color: #e8e8ef; font: 11px/1.4 "Work Sans", sans-serif;
-        box-shadow: 0 12px 40px rgba(0,0,0,.6);
+        width: min(400px, 100%); max-height: 85vh; display: flex; flex-direction: column;
+        background: #14141a; border: 1px solid #2a2a35; border-radius: 12px;
+        color: #e8e8ef; font: 12px/1.45 "Work Sans", system-ui, sans-serif;
+        box-shadow: 0 16px 48px rgba(0,0,0,.65);
       }
       #dg-history-modal .dg-modal-head {
         display: flex; justify-content: space-between; align-items: center;
-        padding: 8px 10px; background: #1a1a22; border-radius: 10px 10px 0 0; font-weight: 600;
+        padding: 12px 14px; background: #1a1a22; border-radius: 12px 12px 0 0;
+        font-weight: 600; font-size: 13px; border-bottom: 1px solid #2a2a35;
       }
       #dg-history-modal .dg-modal-close {
-        background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 0 4px;
+        background: none; border: none; color: #666; cursor: pointer; font-size: 18px; padding: 0 4px;
       }
-      #dg-history-modal .dg-modal-body { padding: 10px; overflow: hidden; display: flex; flex-direction: column; flex: 1; min-height: 0; }
-      #dg-history-modal .dg-modal-hint { margin: 0 0 8px; color: #888; font-size: 10px; }
-      #dg-history-summary { font-size: 10px; color: #888; margin: 0 0 8px; }
-      #dg-history-modal .dg-hist-filters { display: flex; gap: 4px; margin-bottom: 8px; }
+      #dg-history-modal .dg-modal-close:hover { color: #fff; }
+      #dg-history-modal .dg-modal-body {
+        padding: 12px 14px; overflow: hidden; display: flex; flex-direction: column; flex: 1; min-height: 0;
+      }
+      #dg-history-stats {
+        display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px;
+      }
+      #dg-history-modal .dg-hist-stat {
+        padding: 8px 6px; background: #0d0d10; border: 1px solid #2a2a35;
+        border-radius: 8px; text-align: center; min-width: 0;
+      }
+      #dg-history-modal .dg-hist-stat-val {
+        display: block; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+        color: #e8e8ef; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #dg-history-modal .dg-hist-stat-lbl {
+        display: block; font-size: 9px; color: #777; margin-top: 2px; text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      #dg-history-modal .dg-hist-stat-win .dg-hist-stat-val { color: #4ade80; }
+      #dg-history-modal .dg-hist-stat-loss .dg-hist-stat-val { color: #f87171; }
+      #dg-history-modal .dg-hist-filters {
+        display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 10px;
+      }
       #dg-history-modal .dg-hist-filter {
-        flex: 1; padding: 5px; background: #0d0d10; border: 1px solid #333;
+        padding: 6px 4px; background: #0d0d10; border: 1px solid #333;
         border-radius: 6px; color: #888; font-size: 10px; cursor: pointer;
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
       }
-      #dg-history-modal .dg-hist-filter.dg-active { background: #e8e8ef; color: #000; border-color: #e8e8ef; font-weight: 600; }
-      #dg-history-list { overflow-y: auto; flex: 1; max-height: 340px; }
+      #dg-history-modal .dg-hist-filter:hover { color: #ccc; border-color: #444; }
+      #dg-history-modal .dg-hist-filter.dg-active {
+        background: #e8e8ef; color: #000; border-color: #e8e8ef; font-weight: 600;
+      }
+      #dg-history-list {
+        overflow-y: auto; flex: 1; max-height: 380px;
+        padding-right: 2px; scrollbar-width: thin; scrollbar-color: #333 transparent;
+      }
+      #dg-history-list::-webkit-scrollbar { width: 5px; }
+      #dg-history-list::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
       #dg-history-modal .dg-hist-item {
-        padding: 8px; margin-bottom: 4px; background: #0d0d10; border: 1px solid #2a2a35;
-        border-radius: 6px; font-size: 10px;
+        padding: 10px 10px 10px 12px; margin-bottom: 6px; background: #0d0d10;
+        border: 1px solid #2a2a35; border-radius: 8px; font-size: 11px;
+        border-left: 3px solid #444;
       }
-      #dg-history-modal .dg-hist-item.dg-hist-big { border-color: #ca8a04; background: #1a1508; }
-      #dg-history-modal .dg-hist-top { display: flex; justify-content: space-between; color: #aaa; margin-bottom: 3px; }
-      #dg-history-modal .dg-hist-detail { color: #ccc; margin-bottom: 4px; }
-      #dg-history-modal .dg-hist-bottom { display: flex; justify-content: space-between; gap: 6px; color: #888; }
-      #dg-history-modal .dg-hist-pos { color: #6ee7b7; font-weight: 600; }
-      #dg-history-modal .dg-hist-neg { color: #f87171; font-weight: 600; }
-      #dg-history-modal .dg-hist-empty { text-align: center; color: #666; padding: 20px; font-size: 11px; }
+      #dg-history-modal .dg-hist-item.dg-hist-win { border-left-color: #22c55e; }
+      #dg-history-modal .dg-hist-item.dg-hist-loss { border-left-color: #ef4444; }
+      #dg-history-modal .dg-hist-item.dg-hist-big {
+        border-color: #ca8a04; border-left-color: #fbbf24; background: #151208;
+      }
+      #dg-history-modal .dg-hist-row1 {
+        display: flex; align-items: center; gap: 6px; margin-bottom: 5px; flex-wrap: wrap;
+      }
+      #dg-history-modal .dg-hist-badge {
+        font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+        letter-spacing: 0.05em; flex-shrink: 0;
+      }
+      #dg-history-modal .dg-badge-win { background: #14532d; color: #4ade80; }
+      #dg-history-modal .dg-badge-loss { background: #450a0a; color: #f87171; }
+      #dg-history-modal .dg-hist-game { color: #ddd; font-weight: 600; }
+      #dg-history-modal .dg-hist-num { color: #666; font-size: 10px; }
+      #dg-history-modal .dg-hist-fire { font-size: 11px; }
+      #dg-history-modal .dg-hist-time {
+        margin-left: auto; color: #666; font-size: 10px; font-variant-numeric: tabular-nums;
+      }
+      #dg-history-modal .dg-hist-detail {
+        color: #aaa; margin-bottom: 6px; font-size: 11px; line-height: 1.35;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      #dg-history-modal .dg-hist-row3 {
+        display: flex; justify-content: space-between; align-items: flex-end; gap: 8px;
+      }
+      #dg-history-modal .dg-hist-amounts {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px;
+        color: #888; font-size: 10px; font-variant-numeric: tabular-nums;
+      }
+      #dg-history-modal .dg-hist-amounts em {
+        font-style: normal; color: #555; font-size: 9px; text-transform: uppercase;
+        margin-right: 2px;
+      }
+      #dg-history-modal .dg-hist-arrow { color: #555; }
+      #dg-history-modal .dg-hist-mult {
+        padding: 1px 5px; background: #1a1a22; border: 1px solid #333;
+        border-radius: 4px; color: #bbb; font-weight: 600;
+      }
+      #dg-history-modal .dg-hist-profit {
+        font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+        white-space: nowrap; flex-shrink: 0;
+      }
+      #dg-history-modal .dg-hist-profit small { font-size: 9px; font-weight: 500; color: #888; }
+      #dg-history-modal .dg-hist-pos { color: #4ade80; }
+      #dg-history-modal .dg-hist-neg { color: #f87171; }
+      #dg-history-modal .dg-hist-empty {
+        text-align: center; color: #666; padding: 32px 16px; font-size: 12px;
+      }
+      #dg-history-modal .dg-hist-empty-icon { font-size: 28px; margin-bottom: 8px; opacity: 0.6; }
       #dg-history-modal .dg-modal-foot {
-        display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid #2a2a35;
+        display: flex; gap: 6px; padding: 10px 14px; border-top: 1px solid #2a2a35;
       }
       #dg-history-modal .dg-modal-foot button {
-        flex: 1; padding: 6px; border: none; border-radius: 6px; font-size: 11px; cursor: pointer;
+        flex: 1; padding: 8px; border: none; border-radius: 6px; font-size: 11px;
+        cursor: pointer; font-weight: 600;
       }
-      #dg-history-clear { background: #333; color: #ccc; }
+      #dg-history-clear { background: #2a1515; color: #f87171; }
+      #dg-history-clear:hover { background: #3d1a1a; }
       #dg-history-close-btn { background: #2a2a35; color: #e8e8ef; }
+      #dg-history-close-btn:hover { background: #333; }
       #degen-turbo-panel .dg-close {
         background: none; border: none; color: #666; cursor: pointer; font-size: 16px; padding: 0 4px;
       }
@@ -1374,10 +1683,12 @@
           <button type="button" class="dg-modal-close" id="dg-history-modal-close">×</button>
         </div>
         <div class="dg-modal-body">
-          <p class="dg-modal-hint" id="dg-history-summary">0 paris</p>
+          <div id="dg-history-stats"></div>
           <div class="dg-hist-filters">
             <button type="button" class="dg-hist-filter dg-active" data-filter="all">Tous</button>
-            <button type="button" class="dg-hist-filter" data-filter="big">🔥 Gros gains (×${BIG_WIN_MULT}+)</button>
+            <button type="button" class="dg-hist-filter" data-filter="win">Gains</button>
+            <button type="button" class="dg-hist-filter" data-filter="loss">Pertes</button>
+            <button type="button" class="dg-hist-filter" data-filter="big">🔥 ×${BIG_WIN_MULT}+</button>
           </div>
           <div id="dg-history-list"></div>
         </div>
@@ -1403,6 +1714,7 @@
     setModeValue("loss", cfg.lossMode);
     refreshReadyStatus();
     updateStats();
+    updateRunButtons();
     startAssetSync();
 
     document.querySelectorAll(".dg-mode-btn").forEach((btn) => {

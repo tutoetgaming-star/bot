@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.8.0
+// @version      1.8.2
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -29,10 +29,11 @@
 
   let lastBalanceData = null;
   let assetSyncTimer = null;
+  let assetConfirmed = false;
 
   const cfg = {
     game: GM_getValue("dg_game", "dice"),
-    asset: "",
+    asset: GM_getValue("dg_asset", ""),
     betAmount: GM_getValue("dg_bet", "0.0001"),
     delayMs: parseInt(GM_getValue("dg_delay", String(MIN_DELAY)), 10) || MIN_DELAY,
     maxBets: parseInt(GM_getValue("dg_max", "0"), 10) || 0,
@@ -60,84 +61,35 @@
     const next = String(asset).toUpperCase();
     if (next === cfg.asset) return;
     cfg.asset = next;
+    GM_setValue("dg_asset", next);
     refreshReadyStatus();
     updateStats();
   }
 
-  function resolveAssetFromBalance(data, reqAsset) {
+  function resolveAssetFromBalance(data) {
     if (!Array.isArray(data) || !data.length) return;
     lastBalanceData = data;
-    const fromPrimary = data.find((x) => x.isPrimary === true);
-    const asset = reqAsset
-      ? String(reqAsset).toUpperCase()
-      : fromPrimary?.asset;
-    setAsset(asset);
+    const primary = data.find((x) => x.isPrimary === true);
+    if (primary?.asset) {
+      assetConfirmed = true;
+      setAsset(primary.asset);
+    }
   }
 
-  function deepFindAsset(obj, depth = 0) {
-    if (!obj || depth > 8) return null;
-    if (typeof obj === "string") {
-      const up = obj.toUpperCase();
-      return KNOWN_SET.has(up) ? up : null;
+  function syncAssetFromCache() {
+    if (!lastBalanceData?.length) return false;
+    const primary = lastBalanceData.find((x) => x.isPrimary === true);
+    if (primary?.asset) {
+      setAsset(primary.asset);
+      return true;
     }
-    if (typeof obj !== "object") return null;
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        const f = deepFindAsset(item, depth + 1);
-        if (f) return f;
-      }
-      return null;
-    }
-    for (const [k, v] of Object.entries(obj)) {
-      if (/asset|currency|primary|wallet|balance/i.test(k) && typeof v === "string") {
-        const up = v.toUpperCase();
-        if (KNOWN_SET.has(up)) return up;
-      }
-      const f = deepFindAsset(v, depth + 1);
-      if (f) return f;
-    }
-    return null;
-  }
-
-  function detectAssetDeepStorage() {
-    for (const store of [localStorage, sessionStorage]) {
-      try {
-        for (let i = 0; i < store.length; i++) {
-          const val = store.getItem(store.key(i));
-          if (!val) continue;
-          try {
-            const found = deepFindAsset(JSON.parse(val));
-            if (found) return found;
-          } catch (_) {
-            for (const a of KNOWN_ASSETS) {
-              if (val.includes(`"asset":"${a}"`) || val.includes(`"asset":"${a.toLowerCase()}"`)) return a;
-            }
-          }
-        }
-      } catch (_) {}
-    }
-    return null;
-  }
-
-  function detectAssetFromDOM() {
-    try {
-      const els = document.querySelectorAll(
-        "[data-asset], [data-currency], [data-symbol], [class*='wallet'], [class*='balance'], [class*='currency']"
-      );
-      for (const el of els) {
-        const raw = el.dataset?.asset || el.dataset?.currency || el.dataset?.symbol;
-        if (raw && KNOWN_SET.has(String(raw).toUpperCase())) return String(raw).toUpperCase();
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  function detectAssetLocalStorage() {
-    return detectAssetDeepStorage();
+    return false;
   }
 
   function pickAssetHint() {
-    return detectAssetDeepStorage() || detectAssetFromDOM();
+    const fromCache = lastBalanceData?.find((x) => x.isPrimary === true)?.asset;
+    if (fromCache) return String(fromCache).toUpperCase();
+    return null;
   }
 
   async function patchBalancePrimary(asset) {
@@ -155,39 +107,27 @@
     return data;
   }
 
-  async function forceFetchPrimaryAsset() {
-    if (cfg.asset && lastBalanceData?.length) return true;
-
-    if (lastBalanceData?.length) {
-      const primary = lastBalanceData.find((x) => x.isPrimary === true);
-      if (primary?.asset) {
-        setAsset(primary.asset);
-        return true;
+  async function refreshPrimaryBalance() {
+    const asset = pickAssetHint();
+    if (!asset) return false;
+    try {
+      const data = await patchBalancePrimary(asset);
+      if (data) {
+        resolveAssetFromBalance(data);
+        return !!cfg.asset;
       }
-    }
-
-    const hint = pickAssetHint();
-    const data = await patchBalancePrimary(hint || "USDT");
-    if (data) {
-      resolveAssetFromBalance(data, null);
-      return !!cfg.asset;
+    } catch (e) {
+      log("Balance refresh:", e.message);
     }
     return false;
   }
 
-  async function autoDetectAsset() {
-    if (await forceFetchPrimaryAsset()) return true;
-    return !!cfg.asset;
+  async function ensureAsset() {
+    return syncAssetFromCache();
   }
 
-  function parseReqAsset(body) {
-    if (!body) return null;
-    try {
-      const parsed = typeof body === "string" ? JSON.parse(body) : body;
-      return parsed?.asset || null;
-    } catch (_) {
-      return null;
-    }
+  async function autoDetectAsset() {
+    return syncAssetFromCache();
   }
 
   function installAssetHooks() {
@@ -196,12 +136,11 @@
       WIN.fetch = async function (input, init) {
         const url = typeof input === "string" ? input : input?.url || "";
         const isBalance = /\/balance\/primary/.test(url);
-        const reqAsset = isBalance ? parseReqAsset(init?.body) : null;
         const res = await origFetch.apply(this, arguments);
         if (isBalance && res.ok) {
           try {
             const data = await res.clone().json();
-            resolveAssetFromBalance(data, reqAsset);
+            resolveAssetFromBalance(data);
           } catch (_) {}
         }
         return res;
@@ -216,13 +155,13 @@
         this._dgUrl = String(url || "");
         return origOpen.apply(this, arguments);
       };
-      XMLHttpRequest.prototype.send = function (body) {
+      XMLHttpRequest.prototype.send = function () {
         this.addEventListener("load", function () {
           if (!/\/balance\/primary/.test(this._dgUrl || "")) return;
           if (this.status < 200 || this.status >= 300) return;
           try {
             const data = JSON.parse(this.responseText);
-            resolveAssetFromBalance(data, parseReqAsset(body));
+            resolveAssetFromBalance(data);
           } catch (_) {}
         });
         return origSend.apply(this, arguments);
@@ -243,6 +182,7 @@
   let running = false;
   let abort = false;
   let baseBetAmount = cfg.betAmount;
+  let lastMinesGameId = null;
 
   function startAssetSync() {
     const tick = () => autoDetectAsset().then(() => {
@@ -313,37 +253,34 @@
     }
   }
 
-  async function apiGet(path) {
-    const res = await WIN.fetch(API + path, {
-      method: "GET",
-      credentials: "include",
-      headers: { Accept: "application/json, text/plain, */*" }
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const err = new Error(formatApiError(data, res));
-      err.status = res.status;
-      err.data = data;
-      throw err;
-    }
-    return data;
+  function isNetworkError(e) {
+    return e?.network || (!e?.status && /failed to fetch|networkerror|load failed/i.test(e?.message || ""));
   }
 
   async function api(path, body) {
-    const res = await WIN.fetch(API + path, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        Accept: "application/json, text/plain, */*",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+    let res;
+    try {
+      res = await WIN.fetch(API + path, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+    } catch (e) {
+      const err = new Error(e.message || "Réseau indisponible");
+      err.network = true;
+      throw err;
+    }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      log("API", path, res.status, data);
       const err = new Error(formatApiError(data, res));
       err.status = res.status;
       err.data = data;
+      err.path = path;
       throw err;
     }
     return data;
@@ -422,16 +359,6 @@
     };
   }
 
-  function extractActiveMinesGame(data) {
-    if (!data) return null;
-    if (data.id && (data.status === "ACTIVE" || !data.status)) return data;
-    if (data.game?.id) return data.game;
-    if (Array.isArray(data)) {
-      return data.find((g) => g.status === "ACTIVE") || data[0] || null;
-    }
-    return null;
-  }
-
   function extractGameIdFromError(data) {
     if (!data) return null;
     if (data.id) return data.id;
@@ -446,23 +373,6 @@
     } catch (_) {
       return null;
     }
-  }
-
-  async function findActiveMinesGame() {
-    const paths = [
-      "/games/mines/active",
-      "/games/mines/current",
-      "/games/mines/state",
-      "/games/mines"
-    ];
-    for (const path of paths) {
-      try {
-        const data = await apiGet(path);
-        const game = extractActiveMinesGame(data);
-        if (game?.id) return game;
-      } catch (_) {}
-    }
-    return null;
   }
 
   async function cashoutMinesGame(gameId) {
@@ -491,43 +401,49 @@
   }
 
   async function closeActiveMinesGame(quiet) {
-    const active = await findActiveMinesGame();
-    let gameId = active?.id;
-
-    if (!gameId) return false;
-
-    if (!quiet) setStatus(`Partie Mines en cours — cashout…`);
-
+    if (!lastMinesGameId) return false;
+    if (!quiet) setStatus("Cashout partie Mines…");
+    const gameId = lastMinesGameId;
     if (await cashoutMinesGame(gameId)) {
-      if (!quiet) setStatus("Partie Mines récupérée (cashout)");
+      lastMinesGameId = null;
+      if (!quiet) setStatus("Cashout OK");
       return true;
     }
     if (await abandonMinesGame(gameId)) {
-      if (!quiet) setStatus("Partie Mines fermée (abandon)");
+      lastMinesGameId = null;
+      if (!quiet) setStatus("Partie Mines fermée");
       return true;
     }
     return false;
   }
 
   async function recoverMinesFromError(err) {
-    let gameId = extractGameIdFromError(err?.data);
-    if (gameId) {
-      if (await cashoutMinesGame(gameId)) return true;
-      if (await abandonMinesGame(gameId)) return true;
+    const gameId = extractGameIdFromError(err?.data) || lastMinesGameId;
+    if (!gameId) return false;
+    if (await cashoutMinesGame(gameId)) {
+      lastMinesGameId = null;
+      return true;
     }
-    return closeActiveMinesGame(true);
+    if (await abandonMinesGame(gameId)) {
+      lastMinesGameId = null;
+      return true;
+    }
+    return false;
   }
 
   async function minesStart(payload) {
-    await closeActiveMinesGame(true);
     try {
-      return await api("/games/mines/start", payload);
+      const game = await api("/games/mines/start", payload);
+      lastMinesGameId = game.id || null;
+      return game;
     } catch (e) {
       if (e.status !== 400) throw e;
       log("Mines start 400 — récupération…", e.data);
       await recoverMinesFromError(e);
-      await sleep(350);
-      return await api("/games/mines/start", payload);
+      await sleep(400);
+      const game = await api("/games/mines/start", payload);
+      lastMinesGameId = game.id || null;
+      return game;
     }
   }
 
@@ -552,6 +468,7 @@
       });
 
       if (game.status !== "ACTIVE") {
+        lastMinesGameId = null;
         return normalizeMinesResult(game, true);
       }
     }
@@ -561,6 +478,7 @@
       game = await api("/games/mines/cashout", { gameId: game.id });
     }
 
+    lastMinesGameId = null;
     await sleep(MINES_STEP_MS);
     return normalizeMinesResult(game, false);
   }
@@ -725,7 +643,13 @@
   }
 
   function refreshReadyStatus() {
-    setStatus(cfg.asset ? `Prêt — ${cfg.asset}` : "Détection crypto…");
+    if (assetConfirmed && cfg.asset) {
+      setStatus(`Prêt — ${cfg.asset}`);
+    } else if (cfg.asset) {
+      setStatus(`En attente — change de wallet sur Degen`);
+    } else {
+      setStatus("Détection crypto…");
+    }
   }
 
   function updateStats() {
@@ -735,23 +659,24 @@
       `Paris: ${stats.bets} | W: ${stats.wins} L: ${stats.losses} | P/L: ${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(8)} ${cfg.asset || ""}`;
   }
 
-  async function waitForAsset(maxMs = 12000) {
+  async function waitForAsset(maxMs = 15000) {
     const start = Date.now();
-    while (!cfg.asset && Date.now() - start < maxMs) {
-      await forceFetchPrimaryAsset();
-      if (cfg.asset) return;
-      await sleep(400);
+    while (!assetConfirmed && Date.now() - start < maxMs) {
+      syncAssetFromCache();
+      if (assetConfirmed) return;
+      await sleep(500);
     }
+    if (!assetConfirmed) await refreshPrimaryBalance();
   }
 
   async function runLoop() {
     if (running) return;
     readForm();
     setStatus("Détection crypto…");
-    await forceFetchPrimaryAsset();
-    if (!cfg.asset) await waitForAsset();
-    if (!cfg.asset) {
-      setStatus("Crypto introuvable — connecte-toi sur Degen");
+    syncAssetFromCache();
+    if (!assetConfirmed) await waitForAsset();
+    if (!assetConfirmed || !cfg.asset) {
+      setStatus("Crypto introuvable — change de wallet sur Degen puis réessaie");
       return;
     }
     running = true;
@@ -764,10 +689,6 @@
       setStatus("Jeu inconnu");
       running = false;
       return;
-    }
-
-    if (cfg.game === "mines") {
-      await closeActiveMinesGame();
     }
 
     const delay = cfg.game === "mines"
@@ -786,6 +707,11 @@
           setStatus(`#${stats.bets} → ${data.status} (${detail}) | mise ${cfg.betAmount}`);
           if (checkStopLimits()) break;
         } catch (e) {
+          if (isNetworkError(e)) {
+            setStatus("Réseau — pause 2s");
+            await sleep(2000);
+            continue;
+          }
           if (e.status === 429) {
             setStatus("Rate limit — pause 2s");
             await sleep(2000);
@@ -795,10 +721,16 @@
             setStatus("Non connecté ou session expirée");
             break;
           }
-          if (e.status === 400 && cfg.game === "mines") {
-            setStatus("Mines: " + e.message + " — cashout…");
-            await recoverMinesFromError(e);
-            await sleep(500);
+          if (e.status === 400) {
+            const hint = cfg.asset ? ` (${cfg.asset}, mise ${cfg.betAmount})` : "";
+            setStatus("Bad request" + hint + ": " + e.message);
+            log(e.path || cfg.game, e.data);
+            if (cfg.game === "mines") {
+              await recoverMinesFromError(e);
+              await sleep(500);
+            } else {
+              await sleep(1000);
+            }
             continue;
           }
           setStatus("Erreur: " + e.message);
@@ -919,9 +851,13 @@
 
   async function manualMinesCashout() {
     if (running) return;
-    setStatus("Recherche partie Mines…");
+    if (!lastMinesGameId) {
+      setStatus("Aucune partie Mines en mémoire — relance le bot ou attends une erreur 400");
+      return;
+    }
+    setStatus("Cashout partie Mines…");
     const ok = await closeActiveMinesGame();
-    setStatus(ok ? "Cashout OK" : "Aucune partie Mines active");
+    setStatus(ok ? "Cashout OK" : "Cashout impossible");
     refreshReadyStatus();
   }
 
@@ -1362,10 +1298,10 @@
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
       buildUI();
-      forceFetchPrimaryAsset();
+      ensureAsset();
     });
   } else {
     buildUI();
-    forceFetchPrimaryAsset();
+    ensureAsset();
   }
 })();

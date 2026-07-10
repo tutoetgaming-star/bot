@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.10.4
+// @version      1.10.7
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -21,7 +21,7 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.10.4";
+  const SCRIPT_VERSION = "1.10.7";
   const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
   const KENO_LIMITS = { keno_40: 40, keno_50: 50, keno_60: 60, keno_70: 70, keno_80: 80 };
   // Mines = start + reveal(s) + cashout : pas de pause interne, seul le Délai entre manches compte
@@ -73,7 +73,9 @@
     lossMode: GM_getValue("dg_loss_mode", "reset"),
     lossPct: parseFloat(GM_getValue("dg_loss_pct", "0")) || 0,
     stopProfit: parseFloat(GM_getValue("dg_stop_profit", "0")) || 0,
-    stopLoss: parseFloat(GM_getValue("dg_stop_loss", "0")) || 0
+    stopLoss: parseFloat(GM_getValue("dg_stop_loss", "0")) || 0,
+    seedEvery: parseInt(GM_getValue("dg_seed_every", "0"), 10) || 0,
+    seedCustom: GM_getValue("dg_seed_custom", "")
   };
 
   function normalizeKenoVariant(v) {
@@ -310,6 +312,7 @@
   let running = false;
   let abort = false;
   let baseBetAmount = cfg.betAmount;
+  let betsSinceSeedRotate = 0;
 
   function startAssetSync() {
     const tick = () => autoDetectAsset().then(() => {
@@ -345,6 +348,8 @@
     GM_setValue("dg_loss_pct", String(cfg.lossPct));
     GM_setValue("dg_stop_profit", String(cfg.stopProfit));
     GM_setValue("dg_stop_loss", String(cfg.stopLoss));
+    GM_setValue("dg_seed_every", String(cfg.seedEvery));
+    GM_setValue("dg_seed_custom", cfg.seedCustom);
   }
 
   function log(...args) {
@@ -462,6 +467,73 @@
       throw err;
     }
     return data;
+  }
+
+  function randomClientSeed(len = 8) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const arr = new Uint8Array(len);
+    WIN.crypto.getRandomValues(arr);
+    let s = "";
+    for (let i = 0; i < len; i++) s += chars[arr[i] % chars.length];
+    return s;
+  }
+
+  function resolveClientSeed() {
+    const custom = (cfg.seedCustom || document.getElementById("dg-seed-custom")?.value || "").trim();
+    if (custom) return custom.toUpperCase();
+    return randomClientSeed(8);
+  }
+
+  async function rotateClientSeed(forcedSeed) {
+    const clientSeed = forcedSeed || resolveClientSeed();
+    let res;
+    try {
+      // Degen frontend: updateClientSeed => PATCH /games/provably-fair/client-seed
+      res = await WIN.fetch(API + "/games/provably-fair/client-seed", {
+        method: "PATCH",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ clientSeed })
+      });
+    } catch (e) {
+      const err = new Error(e.message || "Réseau indisponible");
+      err.network = true;
+      throw err;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      log("Seed rotate", res.status, data);
+      throw new Error(formatApiError(data, res));
+    }
+    if (data.newClientSeed) {
+      cfg.seedCustom = data.newClientSeed;
+      GM_setValue("dg_seed_custom", cfg.seedCustom);
+      const el = document.getElementById("dg-seed-custom");
+      if (el) el.value = cfg.seedCustom;
+    }
+    setStatus(`Seed → ${data.newClientSeed || clientSeed} (nonce reset)`);
+    log("Seed rotate", data);
+    return data;
+  }
+
+  async function maybeRotateSeed() {
+    if (!cfg.seedEvery || cfg.seedEvery <= 0) return;
+    betsSinceSeedRotate++;
+    if (betsSinceSeedRotate < cfg.seedEvery) return;
+    try {
+      await rotateClientSeed();
+      betsSinceSeedRotate = 0;
+    } catch (e) {
+      if (isNetworkError(e)) {
+        setStatus("Seed auto — réseau, retry au prochain pari");
+      } else {
+        setStatus("Seed auto: " + e.message);
+      }
+      log(e);
+    }
   }
 
   async function betDice() {
@@ -1172,6 +1244,7 @@
           const detail = getBetDetail(data);
           setStatus(`#${stats.bets} → ${data.status} (${detail}) | mise ${cfg.betAmount}`);
           if (checkStopLimits()) break;
+          await maybeRotateSeed();
         } catch (e) {
           if (isNetworkError(e)) {
             setStatus("Réseau — pause 2s");
@@ -1258,6 +1331,8 @@
     cfg.lossPct = parseAmount(document.getElementById("dg-loss-pct").value) || 0;
     cfg.stopProfit = parseAmount(document.getElementById("dg-stop-profit").value) || 0;
     cfg.stopLoss = parseAmount(document.getElementById("dg-stop-loss").value) || 0;
+    cfg.seedEvery = Math.max(0, parseInt(document.getElementById("dg-seed-every")?.value, 10) || 0);
+    cfg.seedCustom = (document.getElementById("dg-seed-custom")?.value || "").trim().toUpperCase();
     save();
     refreshReadyStatus();
     updateStats();
@@ -1343,6 +1418,53 @@
     if (el) el.textContent = "⚡ Degen Turbo v" + SCRIPT_VERSION;
   }
 
+  function seedSectionHtml() {
+    return `
+          <div class="dg-stop-row">
+            <div class="dg-stop-head"><span>Changement de seed (tout les x paris ou 0 manuel )</span><span id="dg-seed-hint">0 = manuel seul</span></div>
+            <div class="dg-seed-row">
+              <input id="dg-seed-every" type="number" min="0" value="${cfg.seedEvery}" placeholder="Tous les N paris" title="0 = désactivé, bouton 🎲 uniquement" />
+              <button type="button" id="dg-seed-btn" title="Changer le client seed maintenant">🎲 Seed</button>
+            </div>
+            <input id="dg-seed-custom" type="text" value="${cfg.seedCustom}" placeholder="Client seed (vide = aléatoire)" maxlength="32" />
+          </div>`;
+  }
+
+  function bindSeedControls() {
+    const btn = document.getElementById("dg-seed-btn");
+    if (!btn || btn._dgBound) return;
+    btn._dgBound = true;
+    btn.onclick = async () => {
+      readForm();
+      btn.disabled = true;
+      try {
+        await rotateClientSeed();
+        betsSinceSeedRotate = 0;
+      } catch (e) {
+        setStatus("Seed: " + e.message);
+        log(e);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    ["dg-seed-every", "dg-seed-custom"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("change", () => readForm());
+    });
+  }
+
+  function upgradeSeedLayout() {
+    if (document.getElementById("dg-seed-every")) {
+      bindSeedControls();
+      return;
+    }
+    const auto = document.querySelector("#degen-turbo-panel .dg-auto");
+    if (!auto) return;
+    const wrap = document.createElement("div");
+    wrap.innerHTML = seedSectionHtml();
+    auto.appendChild(wrap.firstElementChild);
+    bindSeedControls();
+  }
+
   function upgradeStatsLayout() {
     const row = document.querySelector("#degen-turbo-panel .dg-stats-row");
     const old = document.getElementById("dg-stats");
@@ -1373,6 +1495,7 @@
     if (document.getElementById("degen-turbo-panel")) {
       updatePanelTitle();
       upgradeStatsLayout();
+      upgradeSeedLayout();
       startPriceRefresh();
       return;
     }
@@ -1596,6 +1719,14 @@
       #degen-turbo-panel .dg-check-row input { width: auto; flex: 0 0 auto; }
       #degen-turbo-panel .dg-stop-row { margin-bottom: 8px; }
       #degen-turbo-panel .dg-stop-head { display: flex; justify-content: space-between; font-size: 10px; color: #888; margin-bottom: 3px; }
+      #degen-turbo-panel .dg-seed-row { display: flex; gap: 6px; align-items: stretch; margin-bottom: 6px; }
+      #degen-turbo-panel .dg-seed-row input { flex: 1; min-width: 0; margin: 0; }
+      #degen-turbo-panel #dg-seed-btn {
+        flex: 0 0 auto; padding: 6px 10px; background: #444; color: #e8e8ef;
+        border: 1px solid #555; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600;
+      }
+      #degen-turbo-panel #dg-seed-btn:hover:not(:disabled) { background: #555; color: #fff; }
+      #degen-turbo-panel #dg-seed-btn:disabled { opacity: 0.5; cursor: not-allowed; }
       #degen-turbo-panel .dg-btns button { pointer-events: auto; position: relative; z-index: 1; }
       #degen-turbo-panel .dg-label-row {
         display: flex; align-items: center; justify-content: space-between; margin: 6px 0 3px;
@@ -1703,6 +1834,7 @@
             <div class="dg-stop-head"><span>Arrêt en cas de perte</span><span id="dg-stop-loss-hint">0 = désactivé</span></div>
             <input id="dg-stop-loss" type="number" min="0" step="any" value="${cfg.stopLoss}" placeholder="0" />
           </div>
+          ${seedSectionHtml()}
         </div>
 
         <div id="dg-dice-fields" class="dg-fields">
@@ -1889,6 +2021,8 @@
     ["dg-win-pct", "dg-loss-pct", "dg-stop-profit", "dg-stop-loss"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => readForm());
     });
+
+    bindSeedControls();
 
     document.getElementById("dg-start").onclick = () => runLoop();
     document.getElementById("dg-stop").onclick = stop;

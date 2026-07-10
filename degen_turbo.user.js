@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.10.3
+// @version      1.10.4
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_addStyle
 // @connect      api.degen.com
+// @connect      api.coingecko.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -20,18 +21,33 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.10.3";
+  const SCRIPT_VERSION = "1.10.4";
   const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
   const KENO_LIMITS = { keno_40: 40, keno_50: 50, keno_60: 60, keno_70: 70, keno_80: 80 };
   // Mines = start + reveal(s) + cashout : pas de pause interne, seul le Délai entre manches compte
   const KNOWN_ASSETS = ["USDT", "BTC", "ETH", "USDC", "TRX", "SOL", "LTC", "DOGE", "XRP"];
   const KNOWN_SET = new Set(KNOWN_ASSETS);
+  const ASSET_PRICE_IDS = {
+    BTC: "bitcoin",
+    ETH: "ethereum",
+    USDT: "tether",
+    USDC: "usd-coin",
+    TRX: "tron",
+    SOL: "solana",
+    LTC: "litecoin",
+    DOGE: "dogecoin",
+    XRP: "ripple"
+  };
+  const PRICE_TTL_MS = 60000;
   const HISTORY_MAX = 300;
   const BIG_WIN_MULT = 2;
 
   let lastBalanceData = null;
   let assetSyncTimer = null;
   let assetConfirmed = false;
+  let assetPrices = {};
+  let priceFetchedAt = 0;
+  let priceRefreshTimer = null;
 
   const cfg = {
     game: GM_getValue("dg_game", "dice"),
@@ -101,6 +117,7 @@
       assetConfirmed = true;
       setAsset(primary.asset);
     }
+    updateStats();
   }
 
   function syncAssetFromCache() {
@@ -704,6 +721,112 @@
     return v.toFixed(4);
   }
 
+  function balanceUsdRate(asset) {
+    const a = String(asset || "").toUpperCase();
+    const item = lastBalanceData?.find((x) => String(x.asset || "").toUpperCase() === a);
+    if (!item) return null;
+    const bal = parseFloat(item.balance ?? item.available ?? item.amount ?? item.walletBalance ?? 0);
+    const usd = parseFloat(
+      item.usdValue ?? item.usd ?? item.fiatValue ?? item.valueUsd ?? item.valueInUsd
+        ?? item.fiatAmount ?? item.usdBalance ?? 0
+    );
+    if (bal > 0 && usd > 0) return usd / bal;
+    return null;
+  }
+
+  function getCoingeckoUsdRate(asset) {
+    const id = ASSET_PRICE_IDS[String(asset || "").toUpperCase()];
+    const p = id && assetPrices[id];
+    return p?.usd > 0 ? p.usd : null;
+  }
+
+  function getEurPerUsd() {
+    const t = assetPrices.tether || assetPrices["usd-coin"];
+    if (t?.usd > 0 && t?.eur > 0) return t.eur / t.usd;
+    const b = assetPrices.bitcoin;
+    if (b?.usd > 0 && b?.eur > 0) return b.eur / b.usd;
+    return null;
+  }
+
+  function getUsdRate(asset) {
+    return balanceUsdRate(asset) ?? getCoingeckoUsdRate(asset);
+  }
+
+  function cryptoToFiat(cryptoAmt, asset) {
+    const usdRate = getUsdRate(asset);
+    if (!usdRate) return null;
+    const usd = cryptoAmt * usdRate;
+    const eurPerUsd = getEurPerUsd();
+    return { usd, eur: eurPerUsd ? usd * eurPerUsd : null };
+  }
+
+  function formatFiatValue(n, currency) {
+    const v = parseFloat(n);
+    if (isNaN(v)) return "—";
+    const abs = Math.abs(v);
+    const sign = v < 0 ? "-" : v > 0 ? "+" : "";
+    const sym = currency === "eur" ? "€" : "$";
+    if (abs === 0) return `${sym}0.00`;
+    if (abs < 0.01) return `${sign}${sym}${abs.toFixed(4)}`;
+    if (abs < 1) return `${sign}${sym}${abs.toFixed(3)}`;
+    return `${sign}${sym}${abs.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  function formatFiatPair(cryptoAmt, asset) {
+    const fiat = cryptoToFiat(cryptoAmt, asset);
+    if (!fiat) return "";
+    const eurPart = fiat.eur != null ? ` · ${formatFiatValue(fiat.eur, "eur")}` : "";
+    return `${formatFiatValue(fiat.usd, "usd")}${eurPart}`;
+  }
+
+  function sumHistoryFiat(items) {
+    let usd = 0;
+    let eur = 0;
+    let hasUsd = false;
+    let hasEur = false;
+    for (const h of items) {
+      const f = cryptoToFiat(h.profit, h.asset);
+      if (!f) continue;
+      usd += f.usd;
+      hasUsd = true;
+      if (f.eur != null) {
+        eur += f.eur;
+        hasEur = true;
+      }
+    }
+    if (!hasUsd) return "";
+    const eurPart = hasEur ? ` · ${formatFiatValue(eur, "eur")}` : "";
+    return `${formatFiatValue(usd, "usd")}${eurPart}`;
+  }
+
+  async function refreshAssetPrices() {
+    if (Date.now() - priceFetchedAt < PRICE_TTL_MS && Object.keys(assetPrices).length) return;
+    try {
+      const ids = [...new Set(Object.values(ASSET_PRICE_IDS))].join(",");
+      const res = await WIN.fetch(
+        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd,eur`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && typeof data === "object") {
+        assetPrices = data;
+        priceFetchedAt = Date.now();
+        updateStats();
+        if (document.getElementById("dg-history-modal")?.classList.contains("dg-open")) {
+          renderHistory();
+        }
+      }
+    } catch (e) {
+      log("Prix fiat:", e.message);
+    }
+  }
+
+  function startPriceRefresh() {
+    refreshAssetPrices();
+    if (priceRefreshTimer) clearInterval(priceRefreshTimer);
+    priceRefreshTimer = setInterval(refreshAssetPrices, PRICE_TTL_MS);
+  }
+
   const GAME_LABELS = {
     dice: "🎲 Dice",
     limbo: "🚀 Limbo",
@@ -775,6 +898,7 @@
     const asset = history[0]?.asset || cfg.asset || "";
     const pnlClass = totalProfit >= 0 ? "dg-hist-pos" : "dg-hist-neg";
     const pnlSign = totalProfit >= 0 ? "+" : "";
+    const fiatTotal = sumHistoryFiat(history);
 
     el.innerHTML = `
       <div class="dg-hist-stat">
@@ -792,6 +916,7 @@
       <div class="dg-hist-stat ${pnlClass}">
         <span class="dg-hist-stat-val">${pnlSign}${formatAmt(totalProfit)}</span>
         <span class="dg-hist-stat-lbl">P/L ${asset}</span>
+        ${fiatTotal ? `<span class="dg-hist-stat-fiat">${fiatTotal}</span>` : ""}
       </div>
     `;
   }
@@ -829,6 +954,7 @@
     list.innerHTML = items.map((h) => {
       const profitClass = h.profit >= 0 ? "dg-hist-pos" : "dg-hist-neg";
       const profitSign = h.profit >= 0 ? "+" : "";
+      const fiatProfit = formatFiatPair(h.profit, h.asset);
       const itemClass = [
         "dg-hist-item",
         h.won ? "dg-hist-win" : "dg-hist-loss",
@@ -851,7 +977,10 @@
             ${h.win > 0 ? `<span class="dg-hist-arrow">→</span><span><em>Gain</em> ${formatAmt(h.win)}</span>` : ""}
             ${h.mult > 0 ? `<span class="dg-hist-mult">×${h.mult.toFixed(2)}</span>` : ""}
           </div>
-          <span class="dg-hist-profit ${profitClass}">${profitSign}${formatAmt(h.profit)} <small>${h.asset}</small></span>
+          <span class="dg-hist-profit ${profitClass}">
+            ${profitSign}${formatAmt(h.profit)} <small>${h.asset}</small>
+            ${fiatProfit ? `<small class="dg-hist-fiat">${fiatProfit}</small>` : ""}
+          </span>
         </div>
       </div>`;
     }).join("");
@@ -970,6 +1099,7 @@
   function updateStats() {
     const counts = document.getElementById("dg-stats");
     const pnl = document.getElementById("dg-stats-pnl");
+    const pnlFiat = document.getElementById("dg-stats-pnl-fiat");
     if (counts) {
       counts.textContent = `Paris: ${stats.bets} · W: ${stats.wins} · L: ${stats.losses}`;
     }
@@ -978,6 +1108,13 @@
       pnl.textContent = `${sign}${formatAmt(stats.profit)} ${cfg.asset || ""}`;
       pnl.classList.toggle("dg-pnl-pos", stats.profit >= 0);
       pnl.classList.toggle("dg-pnl-neg", stats.profit < 0);
+    }
+    if (pnlFiat) {
+      const fiat = formatFiatPair(stats.profit, cfg.asset);
+      pnlFiat.textContent = fiat || "—";
+      pnlFiat.style.display = fiat ? "" : "none";
+      pnlFiat.classList.toggle("dg-pnl-pos", stats.profit >= 0);
+      pnlFiat.classList.toggle("dg-pnl-neg", stats.profit < 0);
     }
   }
 
@@ -1207,19 +1344,28 @@
   }
 
   function upgradeStatsLayout() {
-    if (document.getElementById("dg-stats-pnl")) return;
     const row = document.querySelector("#degen-turbo-panel .dg-stats-row");
     const old = document.getElementById("dg-stats");
     if (!row || !old) return;
-    const block = document.createElement("div");
-    block.className = "dg-stats-block";
-    const pnl = document.createElement("div");
-    pnl.id = "dg-stats-pnl";
-    pnl.className = "dg-pnl-pos";
-    block.appendChild(old);
-    block.appendChild(pnl);
-    const histBtn = document.getElementById("dg-history-btn");
-    row.insertBefore(block, histBtn || null);
+
+    let block = old.closest(".dg-stats-block");
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "dg-stats-block";
+      const pnl = document.createElement("div");
+      pnl.id = "dg-stats-pnl";
+      pnl.className = "dg-pnl-pos";
+      block.appendChild(old);
+      block.appendChild(pnl);
+      const histBtn = document.getElementById("dg-history-btn");
+      row.insertBefore(block, histBtn || null);
+    }
+    if (!document.getElementById("dg-stats-pnl-fiat")) {
+      const fiat = document.createElement("div");
+      fiat.id = "dg-stats-pnl-fiat";
+      fiat.className = "dg-pnl-pos";
+      block.appendChild(fiat);
+    }
     updateStats();
   }
 
@@ -1227,6 +1373,7 @@
     if (document.getElementById("degen-turbo-panel")) {
       updatePanelTitle();
       upgradeStatsLayout();
+      startPriceRefresh();
       return;
     }
 
@@ -1280,6 +1427,12 @@
       }
       #dg-stats-pnl.dg-pnl-pos { color: #4ade80; }
       #dg-stats-pnl.dg-pnl-neg { color: #f87171; }
+      #dg-stats-pnl-fiat {
+        font-size: 11px; font-weight: 500; line-height: 1.3; margin-top: 2px;
+        font-variant-numeric: tabular-nums;
+      }
+      #dg-stats-pnl-fiat.dg-pnl-pos { color: #86efac; }
+      #dg-stats-pnl-fiat.dg-pnl-neg { color: #fca5a5; }
       #degen-turbo-panel .dg-stats-row {
         display: flex; align-items: flex-end; gap: 6px; margin-top: 4px;
       }
@@ -1399,6 +1552,12 @@
         white-space: nowrap; flex-shrink: 0;
       }
       #dg-history-modal .dg-hist-profit small { font-size: 9px; font-weight: 500; color: #888; }
+      #dg-history-modal .dg-hist-fiat {
+        display: block; font-size: 9px; font-weight: 500; color: #777; margin-top: 1px;
+      }
+      #dg-history-modal .dg-hist-stat-fiat {
+        display: block; font-size: 10px; font-weight: 500; margin-top: 2px; color: #888;
+      }
       #dg-history-modal .dg-hist-pos { color: #4ade80; }
       #dg-history-modal .dg-hist-neg { color: #f87171; }
       #dg-history-modal .dg-hist-empty {
@@ -1649,6 +1808,7 @@
           <div class="dg-stats-block">
             <div id="dg-stats">Paris: 0 · W: 0 · L: 0</div>
             <div id="dg-stats-pnl" class="dg-pnl-pos">+0 ${cfg.asset || ""}</div>
+            <div id="dg-stats-pnl-fiat" class="dg-pnl-pos" style="display:none"></div>
           </div>
           <button type="button" id="dg-history-btn" title="Historique des paris">📜</button>
         </div>
@@ -1716,6 +1876,7 @@
     updateStats();
     updateRunButtons();
     startAssetSync();
+    startPriceRefresh();
 
     document.querySelectorAll(".dg-mode-btn").forEach((btn) => {
       btn.onclick = () => {

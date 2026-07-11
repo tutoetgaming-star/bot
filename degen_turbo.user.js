@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Degen Turbo — Originals
 // @namespace    degen-turbo
-// @version      1.10.7
+// @version      1.10.8
 // @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/degen_turbo.user.js
 // @description  Auto-bet rapide sur les Originals Degen (Dice, Limbo, Plinko, Keno, Mines)
@@ -21,7 +21,7 @@
 
   const WIN = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   const API = "https://api.degen.com/v1";
-  const SCRIPT_VERSION = "1.10.7";
+  const SCRIPT_VERSION = "1.10.8";
   const DEFAULT_DELAY = 55; // valeur par défaut du champ Délai (modifiable librement)
   const KENO_LIMITS = { keno_40: 40, keno_50: 50, keno_60: 60, keno_70: 70, keno_80: 80 };
   // Mines = start + reveal(s) + cashout : pas de pause interne, seul le Délai entre manches compte
@@ -310,6 +310,7 @@
     history = [];
   }
   let running = false;
+  let panelCompact = GM_getValue("dg_panel_compact", "0") === "1";
   let abort = false;
   let baseBetAmount = cfg.betAmount;
   let betsSinceSeedRotate = 0;
@@ -1131,7 +1132,36 @@
   function setStatus(msg) {
     const el = document.getElementById("dg-status");
     if (el) el.textContent = msg;
+    updateCompactSummary(msg);
     log(msg);
+  }
+
+  function setPanelCompact(compact, save) {
+    if (compact && running) return;
+    panelCompact = !!compact;
+    if (save !== false) GM_setValue("dg_panel_compact", panelCompact ? "1" : "0");
+    const panel = document.getElementById("degen-turbo-panel");
+    const btn = document.getElementById("dg-minimize");
+    if (panel) panel.classList.toggle("dg-compact", panelCompact);
+    if (btn) {
+      btn.textContent = panelCompact ? "+" : "−";
+      btn.title = panelCompact ? "Agrandir" : "Réduire";
+      btn.disabled = running;
+    }
+    updateCompactSummary();
+  }
+
+  function togglePanelCompact() {
+    setPanelCompact(!panelCompact);
+  }
+
+  function updateCompactSummary(statusMsg) {
+    const info = document.getElementById("dg-compact-info");
+    if (!info) return;
+    const status = statusMsg ?? document.getElementById("dg-status")?.textContent ?? "";
+    const sign = stats.profit >= 0 ? "+" : "";
+    const pnl = `${sign}${formatAmt(stats.profit)} ${cfg.asset || ""}`.trim();
+    info.textContent = panelCompact ? `${status} · ${pnl}` : "";
   }
 
   function updateRunButtons() {
@@ -1156,6 +1186,8 @@
       stopBtn.classList.remove("dg-run-on");
       stopBtn.textContent = "■ Stop";
     }
+    const minBtn = document.getElementById("dg-minimize");
+    if (minBtn) minBtn.disabled = running;
   }
 
   function refreshReadyStatus() {
@@ -1188,6 +1220,7 @@
       pnlFiat.classList.toggle("dg-pnl-pos", stats.profit >= 0);
       pnlFiat.classList.toggle("dg-pnl-neg", stats.profit < 0);
     }
+    updateCompactSummary();
   }
 
   async function waitForAsset(maxMs = 15000) {
@@ -1219,6 +1252,7 @@
     }
     running = true;
     abort = false;
+    setPanelCompact(false, false);
     updateRunButtons();
     baseBetAmount = formatBetAmount(cfg.betAmount);
     setStatus("En cours…");
@@ -1465,6 +1499,39 @@
     bindSeedControls();
   }
 
+  function upgradeCompactControls() {
+    const head = document.querySelector("#degen-turbo-panel .dg-head");
+    if (!head || document.getElementById("dg-minimize")) return;
+
+    let actions = head.querySelector(".dg-head-actions");
+    const closeBtn = document.getElementById("dg-close");
+    if (!actions && closeBtn) {
+      actions = document.createElement("div");
+      actions.className = "dg-head-actions";
+      closeBtn.replaceWith(actions);
+      actions.appendChild(closeBtn);
+    }
+    if (!actions) return;
+
+    const minBtn = document.createElement("button");
+    minBtn.type = "button";
+    minBtn.className = "dg-minimize";
+    minBtn.id = "dg-minimize";
+    minBtn.title = "Réduire";
+    minBtn.textContent = "−";
+    actions.insertBefore(minBtn, actions.firstChild);
+    minBtn.onclick = togglePanelCompact;
+
+    if (!document.getElementById("dg-compact-info")) {
+      const info = document.createElement("span");
+      info.id = "dg-compact-info";
+      info.className = "dg-compact-info";
+      head.insertBefore(info, actions);
+    }
+
+    setPanelCompact(panelCompact, false);
+  }
+
   function upgradeStatsLayout() {
     const row = document.querySelector("#degen-turbo-panel .dg-stats-row");
     const old = document.getElementById("dg-stats");
@@ -1496,6 +1563,7 @@
       updatePanelTitle();
       upgradeStatsLayout();
       upgradeSeedLayout();
+      upgradeCompactControls();
       startPriceRefresh();
       return;
     }
@@ -1509,13 +1577,36 @@
       }
       #degen-turbo-panel * { box-sizing: border-box; }
       #degen-turbo-panel .dg-head {
-        display: flex; justify-content: space-between; align-items: center;
+        display: flex; justify-content: space-between; align-items: center; gap: 8px;
         padding: 10px 12px; background: #1a1a22; border-radius: 10px 10px 0 0;
         cursor: move; user-select: none; font-weight: 600; font-size: 13px;
       }
+      #degen-turbo-panel.dg-compact .dg-head {
+        border-radius: 10px;
+      }
+      #degen-turbo-panel.dg-compact {
+        width: auto; min-width: 200px; max-width: 320px;
+      }
+      #degen-turbo-panel.dg-compact .dg-body { display: none; }
       #degen-turbo-panel .dg-head .dg-version {
         color: #93c5fd; font-weight: 500; font-size: 11px; margin-left: 4px;
       }
+      #degen-turbo-panel .dg-compact-info {
+        flex: 1; min-width: 0; font-size: 10px; font-weight: 500; color: #888;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        display: none;
+      }
+      #degen-turbo-panel.dg-compact .dg-compact-info { display: block; }
+      #degen-turbo-panel.dg-compact #dg-title { display: none; }
+      #degen-turbo-panel .dg-head-actions {
+        display: flex; align-items: center; gap: 2px; flex-shrink: 0;
+      }
+      #degen-turbo-panel .dg-minimize {
+        background: none; border: none; color: #666; cursor: pointer;
+        font-size: 16px; line-height: 1; padding: 0 4px; flex: 0 0 auto;
+      }
+      #degen-turbo-panel .dg-minimize:hover:not(:disabled) { color: #fff; }
+      #degen-turbo-panel .dg-minimize:disabled { opacity: 0.35; cursor: not-allowed; }
       #degen-turbo-panel label { display: block; margin: 6px 0 3px; color: #999; font-size: 11px; }
       #degen-turbo-panel input, #degen-turbo-panel select {
         width: 100%; padding: 6px 8px; background: #0d0d10; border: 1px solid #333;
@@ -1777,7 +1868,11 @@
     panel.innerHTML = `
       <div class="dg-head">
         <span id="dg-title">⚡ Degen Turbo<span class="dg-version">v${SCRIPT_VERSION}</span></span>
-        <button class="dg-close" id="dg-close" title="Masquer">×</button>
+        <span id="dg-compact-info" class="dg-compact-info"></span>
+        <div class="dg-head-actions">
+          <button type="button" class="dg-minimize" id="dg-minimize" title="Réduire">−</button>
+          <button type="button" class="dg-close" id="dg-close" title="Masquer">×</button>
+        </div>
       </div>
       <div class="dg-body">
         <label>Jeu</label>
@@ -2029,6 +2124,8 @@
     document.getElementById("dg-cashout").onclick = () => manualMinesCashout();
     document.getElementById("dg-reset").onclick = resetStats;
     document.getElementById("dg-close").onclick = () => { panel.style.display = "none"; };
+    document.getElementById("dg-minimize").onclick = togglePanelCompact;
+    setPanelCompact(panelCompact, false);
     document.getElementById("dg-game").onchange = () => { readForm(); };
     ["dg-keno-variant", "dg-keno-risk", "dg-keno-numbers", "dg-keno-pick-count"].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", () => readForm());

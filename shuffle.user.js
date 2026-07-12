@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         WaggerBot — Shuffle Auto Claimer
 // @namespace    waggerbot
-// @version      1.2.2
+// @version      1.2.3
 // @description  WaggerBot — claim auto des codes Shuffle via @shufflecodesdrops
 // @match        https://shuffle.com/*
 // @match        https://shuffle.bet/*
+// @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/shuffle.user.js
+// @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/shuffle.user.js
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -708,10 +710,7 @@
   // --- Geetest ---------------------------------------------------------------
 
   async function loadGeetest() {
-    if (state.geetestLoaded || WIN.initGeetest4) {
-      state.geetestLoaded = true;
-      return;
-    }
+    if (state.geetestLoaded && WIN.initGeetest4) return;
     await new Promise((resolve, reject) => {
       const s = WIN.document.createElement("script");
       s.src = "https://static.geetest.com/v4/gt4.js";
@@ -731,7 +730,18 @@
         if (/geetest|gt_/i.test(k)) WIN.localStorage.removeItem(k);
       });
     } catch {}
+    try { delete WIN.initGeetest4; } catch {}
     state.geetestLoaded = false;
+  }
+
+  function normalizeGeetestValidate(v) {
+    if (!v?.lot_number || !v?.captcha_output || !v?.pass_token || v?.gen_time == null) return null;
+    return {
+      lot_number: String(v.lot_number),
+      captcha_output: String(v.captcha_output),
+      pass_token: String(v.pass_token),
+      gen_time: String(v.gen_time)
+    };
   }
 
   function solveGeetest(nonce) {
@@ -755,12 +765,11 @@
             if (!cbName) continue;
             const orig = WIN[cbName];
             WIN[cbName] = function (data) {
-              const seccode = data?.data?.seccode;
-              if (seccode?.lot_number) {
+              const seccode = normalizeGeetestValidate(data?.data?.seccode);
+              if (seccode) {
                 finish(() => resolve(seccode));
-              } else if (data?.data?.result === "continue") {
-                finish(() => reject(new Error("Captcha visuel requis")));
               }
+              // "continue" = puzzle visuel — on laisse l'UI Geetest ouverte, onSuccess résoudra
               return orig?.apply(this, arguments);
             };
           }
@@ -773,7 +782,7 @@
       WIN.document.body.appendChild(container);
 
       let captchaObj = null;
-      const timer = setTimeout(() => finish(() => reject(new Error("Captcha timeout"))), 8000);
+      const timer = setTimeout(() => finish(() => reject(new Error("Captcha timeout"))), 20000);
 
       WIN.initGeetest4({
         captchaId: GEETEST_CAPTCHA_ID,
@@ -786,13 +795,12 @@
         obj.showCaptcha();
         obj.onSuccess(() => {
           if (done) return;
-          const v = obj.getValidate();
-          finish(() => resolve({
-            lot_number: v.lot_number,
-            captcha_output: v.captcha_output,
-            pass_token: v.pass_token,
-            gen_time: v.gen_time
-          }));
+          const v = normalizeGeetestValidate(obj.getValidate());
+          if (!v) {
+            finish(() => reject(new Error("Captcha incomplet — réessayez")));
+            return;
+          }
+          finish(() => resolve(v));
         });
         obj.onError(err => finish(() => reject(new Error("Geetest: " + JSON.stringify(err)))));
       });
@@ -800,9 +808,10 @@
   }
 
   async function hmacSign(userId, payload) {
+    if (!userId) throw new Error("userId manquant — rechargez la page (F5)");
     const key = await crypto.subtle.importKey(
       "raw",
-      new TextEncoder().encode(userId),
+      new TextEncoder().encode(String(userId)),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
@@ -853,58 +862,80 @@
     }
     try {
       if (!state.bearerToken) await captureShuffleToken();
-      await loadGeetest();
+      if (!state.userId) throw new Error("Session invalide — rechargez Shuffle (F5)");
 
-      const nonceRes = await gql("GetGeetestNonce", {}, "mutation GetGeetestNonce { geetestNonce }");
-      if (nonceRes.errors) throw new Error(nonceRes.errors[0].message);
-      const nonce = nonceRes.data.geetestNonce;
-
-      let geetest;
-      try {
-        geetest = await solveGeetest(nonce);
-      } catch (e) {
-        purgeGeetest();
-        throw e;
-      }
-
-      const token = await hmacSign(state.userId, code + "-" + geetest.captcha_output);
-      const redeemRes = await gql(
-        "RedeemPromoCode",
-        {
-          data: {
-            codeSlug: code,
-            currency: config.currency,
-            token,
-            geetest: {
-              lot_number: geetest.lot_number,
-              captcha_output: geetest.captcha_output,
-              pass_token: geetest.pass_token,
-              gen_time: geetest.gen_time
-            }
-          }
-        },
-        "mutation RedeemPromoCode($data: PromotionCodeInput!) { redeemPromotionCode(data: $data) { id currency createdAt afterBalance usdRedeemValue __typename } }"
-      );
-
-      if (redeemRes.errors) {
-        const msg = redeemRes.errors[0].message;
-        const info = classifyClaimError(msg);
-        if (msg.includes("CAPTCHA")) purgeGeetest();
-        if (info.kind === "already" || info.kind === "dead") {
-          config.seenCodes[code + "_dead"] = Date.now();
-          markClaimResult(code, false, info.label, null, info.kind);
-          toast("?? " + code + " — " + info.label, "warning");
-        } else {
-          markClaimResult(code, false, info.label, null, "error");
-          toast("? " + code + ": " + info.label, "error");
-          notify("Échec claim", code + " — " + info.label);
+      let lastCaptchaError = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (attempt > 1) {
+          purgeGeetest();
+          await new Promise(r => setTimeout(r, 1500));
+          setStatus("Claim " + code + " — retry captcha…");
         }
-      } else {
+
+        await loadGeetest();
+        const nonceRes = await gql("GetGeetestNonce", {}, "mutation GetGeetestNonce { geetestNonce }");
+        if (nonceRes.errors) throw new Error(nonceRes.errors[0].message);
+        const nonce = nonceRes.data.geetestNonce;
+
+        let geetest;
+        try {
+          geetest = await solveGeetest(nonce);
+        } catch (e) {
+          purgeGeetest();
+          throw e;
+        }
+
+        const token = await hmacSign(state.userId, code + "-" + geetest.captcha_output);
+        const redeemRes = await gql(
+          "RedeemPromoCode",
+          {
+            data: {
+              codeSlug: code,
+              currency: config.currency,
+              token,
+              geetest: {
+                lot_number: geetest.lot_number,
+                captcha_output: geetest.captcha_output,
+                pass_token: geetest.pass_token,
+                gen_time: geetest.gen_time
+              }
+            }
+          },
+          "mutation RedeemPromoCode($data: PromotionCodeInput!) { redeemPromotionCode(data: $data) { id currency createdAt afterBalance usdRedeemValue __typename } }"
+        );
+
+        if (redeemRes.errors) {
+          const msg = redeemRes.errors[0].message;
+          const info = classifyClaimError(msg);
+          if (/CAPTCHA/i.test(msg)) {
+            purgeGeetest();
+            lastCaptchaError = msg;
+            if (attempt < 2) continue;
+          }
+          if (info.kind === "already" || info.kind === "dead") {
+            config.seenCodes[code + "_dead"] = Date.now();
+            markClaimResult(code, false, info.label, null, info.kind);
+            toast("?? " + code + " — " + info.label, "warning");
+          } else {
+            markClaimResult(code, false, info.label, null, "error");
+            toast("? " + code + ": " + info.label, "error");
+            notify("Échec claim", code + " — " + info.label);
+          }
+          return;
+        }
+
         const val = redeemRes.data?.redeemPromotionCode?.usdRedeemValue;
         markClaimResult(code, true, null, val ? "$" + val : null);
         config.seenCodes[code + "_ok"] = Date.now();
         toast("? " + code + " réclamé!" + (val ? " · $" + val : ""), "success");
         notify("Code réclamé!", code + (val ? " · $" + val : ""));
+        return;
+      }
+
+      if (lastCaptchaError) {
+        markClaimResult(code, false, lastCaptchaError);
+        toast("? " + code + ": " + lastCaptchaError, "error");
+        notify("Échec claim", code + " — " + lastCaptchaError);
       }
     } catch (err) {
       markClaimResult(code, false, err.message);
@@ -1373,7 +1404,7 @@
         <button class="wb-tab" data-tab="settings">Réglages</button>
       </div>
       <div id="wb-panel-history" class="wb-tab-panel active">
-        <div style="padding:10px 16px 0;font-size:11px;color:var(--wb-muted)">Source · <a href="https://t.me/autoclaim_shuffle" target="_blank" style="color:var(--wb-purple2);text-decoration:none">@autoclaim_shuffle</a></div>
+        <div style="padding:10px 16px 0;font-size:11px;color:var(--wb-muted)">Source · <a href="https://t.me/shufflecodesdrops" target="_blank" style="color:var(--wb-purple2);text-decoration:none">@shufflecodesdrops</a></div>
         <div id="wb-codes"></div>
       </div>
       <div id="wb-panel-stats" class="wb-tab-panel">

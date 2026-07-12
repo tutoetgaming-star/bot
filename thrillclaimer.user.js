@@ -2,8 +2,8 @@
 // @name         WaggerBot — Thrill Auto Claimer
 // @namespace    waggerbot
 // @version      1.0.3
-// @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/thrillclaimer_user.js
-// @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/thrillclaimer_user.js
+// @updateURL    https://raw.githubusercontent.com/tutoetgaming-star/bot/main/thrillclaimer.user.js
+// @downloadURL  https://raw.githubusercontent.com/tutoetgaming-star/bot/main/thrillclaimer.user.js
 // @description  WaggerBot — claim auto des cash drops Thrill via @thrilldrops et @Thrillcom
 // @match        https://thrill.com/*
 // @grant        unsafeWindow

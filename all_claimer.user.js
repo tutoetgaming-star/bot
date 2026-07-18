@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         All Claimer — V4
 // @namespace    waggerbot
-// @version      4.3.1
+// @version      4.5.3
 // @description  WaggerBot — claim auto Shuffle, Stake et Thrill + jeux Originaux Thrill
 // @match        https://shuffle.com/*
 // @match        https://shuffle.bet/*
@@ -5942,8 +5942,10 @@
           const ORIGINALS_GAMES = {
             keno: { product: "thrill-keno", slug: "thrill-keno" },
             dice: { product: "thrill-dice", slug: "thrill-dice" },
-            limbo: { product: "thrill-limbo", slug: "thrill-limbo" }
+            limbo: { product: "thrill-limbo", slug: "thrill-limbo" },
+            mines: { product: "thrill-mines", slug: "thrill-mines" }
           };
+          const MINES_EDGE_DEFAULT = 5;
 
           const state = {
             bearerToken: null,
@@ -5980,6 +5982,13 @@
               lastResult: null,
             },
             limbo: {
+              playing: false,
+              autoRunning: false,
+              history: [],
+              lastResult: null,
+            },
+            mines: {
+              tiles: [],
               playing: false,
               autoRunning: false,
               history: [],
@@ -6037,6 +6046,23 @@
             diceHistory: storage.getJSON("thr_dice_history", []),
             limboMult: parseFloat(storage.get("thr_limbo_mult", "2")) || 2,
             limboHistory: storage.getJSON("thr_limbo_history", []),
+            minesCount: parseInt(storage.get("thr_mines_count", "3"), 10) || 3,
+            minesReveal: parseInt(storage.get("thr_mines_reveal", "1"), 10) || 1,
+            minesEdge: parseInt(storage.get("thr_mines_edge", String(MINES_EDGE_DEFAULT)), 10) || MINES_EDGE_DEFAULT,
+            minesTiles: storage.getJSON("thr_mines_tiles", [12]),
+            minesAutoRandom: !!storage.get("thr_mines_auto_random", false),
+            minesAutoRandomCount: parseInt(storage.get("thr_mines_auto_rand_count", "1"), 10) || 1,
+            minesHistory: storage.getJSON("thr_mines_history", []),
+            autoOnWin: storage.get("thr_auto_on_win", "reset") === "increase" ? "increase" : "reset",
+            autoOnWinPct: Math.max(0, parseFloat(storage.get("thr_auto_on_win_pct", "0")) || 0),
+            autoOnLoss: storage.get("thr_auto_on_loss", "increase") === "reset" ? "reset" : "increase",
+            autoOnLossPct: Math.max(0, parseFloat(storage.get("thr_auto_on_loss_pct", "29")) || 0),
+            autoStopProfit: Math.max(0, parseFloat(storage.get("thr_auto_stop_profit", "0")) || 0),
+            autoStopLoss: Math.max(0, parseFloat(storage.get("thr_auto_stop_loss", "0")) || 0),
+            autoSeedEvery: Math.max(0, parseInt(storage.get("thr_auto_seed_every", "0"), 10) || 0),
+            autoClientSeed: String(storage.get("thr_auto_client_seed", "") || ""),
+            autoStratOpen: !!storage.get("thr_auto_strat_open", false),
+            minesSettingsOpen: !!storage.get("thr_mines_settings_open", false),
             activeOriginal: storage.get("thr_active_original", "keno") || "keno",
             playerToken: storage.get("thr_player_token", "") || "",
             playerTokens: storage.getJSON("thr_player_tokens", {}) || {},
@@ -6044,7 +6070,7 @@
             exchangeRate: parseFloat(storage.get("thr_fx_rate", "0")) || 0,
           };
 
-          state.activeOriginal = ["dice", "limbo"].includes(config.activeOriginal) ? config.activeOriginal : "keno";
+          state.activeOriginal = ["dice", "limbo", "mines"].includes(config.activeOriginal) ? config.activeOriginal : "keno";
           {
             const fromUrl = detectOriginalFromLocation();
             if (fromUrl) state.activeOriginal = fromUrl;
@@ -6064,6 +6090,15 @@
           if (Array.isArray(config.limboHistory) && config.limboHistory.length) {
             state.limbo.history = config.limboHistory.slice(0, HIST_STORE_LIMIT);
             state.limbo.lastResult = state.limbo.history[0] || null;
+          }
+          if (Array.isArray(config.minesHistory) && config.minesHistory.length) {
+            state.mines.history = config.minesHistory.slice(0, HIST_STORE_LIMIT);
+            state.mines.lastResult = state.mines.history[0] || null;
+          }
+          if (Array.isArray(config.minesTiles)) {
+            state.mines.tiles = config.minesTiles.map(Number).filter(n => Number.isFinite(n) && n >= 0);
+          } else {
+            state.mines.tiles = [12];
           }
           if (!config.kenoCurrency) {
             // Par défaut : devise du dernier coup, sinon claim, sinon SOL
@@ -6229,6 +6264,23 @@
               storage.setJSON("thr_dice_history", state.dice.history.slice(0, HIST_STORE_LIMIT));
               storage.set("thr_limbo_mult", String(config.limboMult));
               storage.setJSON("thr_limbo_history", state.limbo.history.slice(0, HIST_STORE_LIMIT));
+              storage.set("thr_mines_count", String(config.minesCount));
+              storage.set("thr_mines_reveal", String(config.minesReveal));
+              storage.set("thr_mines_edge", String(config.minesEdge));
+              storage.setJSON("thr_mines_tiles", state.mines.tiles || []);
+              storage.set("thr_mines_auto_random", !!config.minesAutoRandom);
+              storage.set("thr_mines_auto_rand_count", String(config.minesAutoRandomCount || 1));
+              storage.setJSON("thr_mines_history", state.mines.history.slice(0, HIST_STORE_LIMIT));
+              storage.set("thr_auto_on_win", config.autoOnWin === "increase" ? "increase" : "reset");
+              storage.set("thr_auto_on_win_pct", String(config.autoOnWinPct || 0));
+              storage.set("thr_auto_on_loss", config.autoOnLoss === "reset" ? "reset" : "increase");
+              storage.set("thr_auto_on_loss_pct", String(config.autoOnLossPct || 0));
+              storage.set("thr_auto_stop_profit", String(config.autoStopProfit || 0));
+              storage.set("thr_auto_stop_loss", String(config.autoStopLoss || 0));
+              storage.set("thr_auto_seed_every", String(config.autoSeedEvery || 0));
+              storage.set("thr_auto_client_seed", String(config.autoClientSeed || ""));
+              storage.set("thr_auto_strat_open", !!config.autoStratOpen);
+              storage.set("thr_mines_settings_open", !!config.minesSettingsOpen);
               storage.set("thr_active_original", state.activeOriginal || "keno");
               storage.set("thr_player_token", state.playerToken || config.playerToken || "");
               storage.setJSON("thr_player_tokens", state.playerTokens || {});
@@ -6632,6 +6684,7 @@
             const p = String(WIN.location.pathname || "");
             if (/\/casino\/play\/thrill-dice\b/i.test(p)) return "dice";
             if (/\/casino\/play\/thrill-limbo\b/i.test(p)) return "limbo";
+            if (/\/casino\/play\/thrill-mines\b/i.test(p)) return "mines";
             if (/\/casino\/play\/thrill-keno\b/i.test(p)) return "keno";
             return null;
           }
@@ -6643,6 +6696,7 @@
 
           function originalsGameFromProductOrUrl(productOrUrl) {
             const s = String(productOrUrl || "").toLowerCase();
+            if (s.includes("mines")) return "mines";
             if (s.includes("limbo")) return "limbo";
             if (s.includes("dice")) return "dice";
             if (s.includes("keno")) return "keno";
@@ -6685,7 +6739,7 @@
 
           function selectOriginalGame(game, opts) {
             opts = opts || {};
-            const g = ["keno", "dice", "limbo"].includes(game) ? game : "keno";
+            const g = ["keno", "dice", "limbo", "mines"].includes(game) ? game : "keno";
             state.activeOriginal = g;
             activatePlayerTokenForGame(g);
             persistConfig();
@@ -6832,9 +6886,14 @@
                       : clampDiceTarget("Under", c0.toValue);
                   }
                 }
-                if (obj.payoutMultiplier != null && !obj.coverage && !obj.spots) {
+                if (obj.payoutMultiplier != null && !obj.coverage && !obj.spots && obj.numberOfMines == null) {
                   const pm = Number(obj.payoutMultiplier);
                   if (pm >= 1.01) config.limboMult = clampLimboMult(pm);
+                }
+                if (obj.numberOfMines != null) {
+                  const edge = clampMinesEdge(obj.edgeSize != null ? obj.edgeSize : config.minesEdge);
+                  config.minesEdge = edge;
+                  config.minesCount = clampMinesCount(obj.numberOfMines, edge);
                 }
               }
             } catch {}
@@ -6987,6 +7046,7 @@
                     if (pn) return String(pn);
                   } catch (e0) {}
                   u = String(u || "").toLowerCase();
+                  if (u.indexOf("mines") !== -1) return "thrill-mines";
                   if (u.indexOf("limbo") !== -1) return "thrill-limbo";
                   if (u.indexOf("dice") !== -1) return "thrill-dice";
                   if (u.indexOf("keno") !== -1) return "thrill-keno";
@@ -7501,7 +7561,7 @@
             const walletStake = +Number(stake).toFixed(12);
             const anchorStake = +(walletStake / fx).toFixed(12);
 
-            return {
+            return attachClientSeed({
               inputInAnchorCurrency: false,
               walletCurrencyIsoCode: cur,
               anchorCurrencyIsoCode: "EUR",
@@ -7511,7 +7571,7 @@
               riskProfile: config.kenoRisk || "Classic",
               spots,
               playoutTimeMilliseconds: Math.max(0, Number(config.kenoPlayoutMs) || 0)
-            };
+            });
           }
 
           function gmGetJson(url) {
@@ -7687,6 +7747,266 @@
             config.kenoPlayoutMs = p.playout;
             persistConfig();
             renderGamesPanel();
+          }
+
+          // --- Auto stratégie (tous jeux) -------------------------------------------
+
+          function randomClientSeed(len) {
+            const n = Math.max(8, Math.min(64, len || 16));
+            const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            let s = "";
+            for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
+            return s;
+          }
+
+          function attachClientSeed(body) {
+            if (!body || typeof body !== "object") return body;
+            const s = String(config.autoClientSeed || "").trim();
+            if (s) body.clientSeed = s;
+            return body;
+          }
+
+          function createAutoStratSession() {
+            const base = Math.max(0, Number(config.kenoStake) || 0);
+            return {
+              baseStake: base,
+              currentStake: base,
+              sessionPnl: 0,
+              bets: 0,
+              wins: 0,
+              stopReason: null
+            };
+          }
+
+          function autoResultIsWin(game, r) {
+            if (game === "mines") return !r.hit && (Number(r.profit) || 0) >= 0;
+            return (Number(r.profit) || 0) > 0;
+          }
+
+          function autoResultIsLoss(game, r) {
+            if (game === "mines") return !!r.hit || (Number(r.profit) || 0) < 0;
+            return (Number(r.profit) || 0) < 0;
+          }
+
+          function applyAutoStakeAfterResult(session, game, r) {
+            const profit = Number(r.profit) || 0;
+            session.sessionPnl += profit;
+            session.bets++;
+            if (autoResultIsWin(game, r)) {
+              session.wins++;
+              if (config.autoOnWin === "increase") {
+                const pct = Math.max(0, Number(config.autoOnWinPct) || 0);
+                session.currentStake = session.currentStake * (1 + pct / 100);
+              } else {
+                session.currentStake = session.baseStake;
+              }
+            } else if (autoResultIsLoss(game, r)) {
+              if (config.autoOnLoss === "increase") {
+                const pct = Math.max(0, Number(config.autoOnLossPct) || 0);
+                session.currentStake = session.currentStake * (1 + pct / 100);
+              } else {
+                session.currentStake = session.baseStake;
+              }
+            }
+            session.currentStake = +Math.max(0, Number(session.currentStake) || 0).toFixed(12);
+            config.kenoStake = session.currentStake;
+
+            const stopProfit = Math.max(0, Number(config.autoStopProfit) || 0);
+            const stopLoss = Math.max(0, Number(config.autoStopLoss) || 0);
+            if (stopProfit > 0 && session.sessionPnl >= stopProfit) {
+              session.stopReason = "profit +" + formatKenoAmt(session.sessionPnl);
+              return false;
+            }
+            if (stopLoss > 0 && session.sessionPnl <= -stopLoss) {
+              session.stopReason = "perte " + formatKenoAmt(session.sessionPnl);
+              return false;
+            }
+            return true;
+          }
+
+          async function rotateOriginalsSeed(productName, opts) {
+            opts = opts || {};
+            let seed = String(config.autoClientSeed || "").trim();
+            if (!seed) seed = randomClientSeed(16);
+            config.autoClientSeed = seed;
+            persistConfig();
+            const body = { clientSeed: seed };
+            const paths = ["/v1/seed", "/v1/seeds", "/v1/seed/rotate", "/v1/client-seed"];
+            let lastErr = null;
+            for (const path of paths) {
+              try {
+                const { status, data } = await postGameBet(path, productName, body, {
+                  preferDirect: !!opts.fast
+                });
+                if (status < 400 && (!data || !data.responseCode || data.responseCode === "OK")) {
+                  const next = data?.data?.clientSeed || data?.clientSeed || seed;
+                  config.autoClientSeed = String(next);
+                  persistConfig();
+                  const el = document.getElementById("wb-auto-client-seed");
+                  if (el) el.value = config.autoClientSeed;
+                  if (!opts.silent) toast("Seed OK · " + config.autoClientSeed, "success");
+                  return config.autoClientSeed;
+                }
+                lastErr = (data && (data.message || data.responseCode)) || ("HTTP " + status);
+              } catch (err) {
+                lastErr = err && err.message;
+              }
+            }
+            // Fallback local : le seed partira dans les bets (clientSeed)
+            const el = document.getElementById("wb-auto-client-seed");
+            if (el) el.value = config.autoClientSeed;
+            if (!opts.silent) {
+              toast("Seed local · " + config.autoClientSeed + (lastErr ? " (" + lastErr + ")" : ""), "info");
+            }
+            return config.autoClientSeed;
+          }
+
+          async function maybeAutoRotateSeed(session, productName, opts) {
+            const every = Math.max(0, parseInt(config.autoSeedEvery, 10) || 0);
+            if (every <= 0 || !session || session.bets <= 0) return;
+            if (session.bets % every !== 0) return;
+            try {
+              await rotateOriginalsSeed(productName, Object.assign({ silent: true, fast: true }, opts || {}));
+            } catch (err) {
+              log("Seed auto:", err && err.message);
+            }
+          }
+
+          function finishAutoStratSession(session) {
+            if (!session) return;
+            config.kenoStake = session.baseStake;
+            persistConfig();
+          }
+
+          function autoStratHtml() {
+            const onWin = config.autoOnWin === "increase" ? "increase" : "reset";
+            const onLoss = config.autoOnLoss === "reset" ? "reset" : "increase";
+            const cur = getKenoCurrency();
+            const open = !!config.autoStratOpen;
+            return `
+              <details class="wb-fold" id="wb-auto-strat-fold"${open ? " open" : ""}>
+                <summary class="wb-fold-summary">
+                  <span>Configurer automatiquement</span>
+                  <span class="wb-fold-hint">${onWin === "reset" ? "W reset" : "W +" + (config.autoOnWinPct || 0) + "%"} · ${onLoss === "reset" ? "L reset" : "L +" + (config.autoOnLossPct || 0) + "%"}</span>
+                </summary>
+                <div class="wb-auto-strat">
+                  <div class="wb-auto-row">
+                    <div class="wb-auto-label">Sur victoire</div>
+                    <div class="wb-auto-seg" data-auto-mode="win">
+                      <button type="button" class="wb-auto-seg-btn${onWin === "reset" ? " active" : ""}" data-val="reset">Réinitialiser</button>
+                      <button type="button" class="wb-auto-seg-btn${onWin === "increase" ? " active" : ""}" data-val="increase">Augmenté de</button>
+                    </div>
+                    <label class="wb-auto-pct">
+                      <input id="wb-auto-on-win-pct" type="number" min="0" step="any" value="${config.autoOnWinPct || 0}"/>
+                      <span>%</span>
+                    </label>
+                  </div>
+                  <div class="wb-auto-row">
+                    <div class="wb-auto-label">En cas de perte</div>
+                    <div class="wb-auto-seg" data-auto-mode="loss">
+                      <button type="button" class="wb-auto-seg-btn${onLoss === "reset" ? " active" : ""}" data-val="reset">Réinitialiser</button>
+                      <button type="button" class="wb-auto-seg-btn${onLoss === "increase" ? " active" : ""}" data-val="increase">Augmenté de</button>
+                    </div>
+                    <label class="wb-auto-pct">
+                      <input id="wb-auto-on-loss-pct" type="number" min="0" step="any" value="${config.autoOnLossPct || 0}"/>
+                      <span>%</span>
+                    </label>
+                  </div>
+                  <div class="wb-keno-controls" style="margin-top:8px">
+                    <label>Arrêtez sur le profit (${cur})
+                      <input id="wb-auto-stop-profit" type="number" min="0" step="any" value="${config.autoStopProfit || 0}"/>
+                      <span class="wb-auto-hint">0 = désactivé</span>
+                    </label>
+                    <label>Arrêt en cas de perte (${cur})
+                      <input id="wb-auto-stop-loss" type="number" min="0" step="any" value="${config.autoStopLoss || 0}"/>
+                      <span class="wb-auto-hint">0 = désactivé</span>
+                    </label>
+                    <label>Changement de seed (tous les x paris)
+                      <div class="wb-auto-seed-row">
+                        <input id="wb-auto-seed-every" type="number" min="0" max="10000" value="${config.autoSeedEvery || 0}"/>
+                        <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-auto-seed-btn">Seed</button>
+                      </div>
+                      <span class="wb-auto-hint">0 = manuel seul</span>
+                    </label>
+                    <label>Client seed (vide = aléatoire)
+                      <input id="wb-auto-client-seed" type="text" maxlength="64" value="${String(config.autoClientSeed || "").replace(/"/g, "&quot;")}" placeholder="aléatoire"/>
+                    </label>
+                  </div>
+                </div>
+              </details>
+            `;
+          }
+
+          function bindAutoStrat(root) {
+            if (!root) return;
+            const fold = document.getElementById("wb-auto-strat-fold");
+            if (fold) {
+              fold.open = !!config.autoStratOpen;
+              fold.ontoggle = () => {
+                config.autoStratOpen = !!fold.open;
+                persistConfig();
+              };
+            }
+            root.querySelectorAll(".wb-auto-seg").forEach(seg => {
+              const mode = seg.dataset.autoMode;
+              seg.querySelectorAll(".wb-auto-seg-btn").forEach(btn => {
+                btn.onclick = () => {
+                  const val = btn.dataset.val === "increase" ? "increase" : "reset";
+                  if (mode === "win") config.autoOnWin = val;
+                  else config.autoOnLoss = val;
+                  persistConfig();
+                  seg.querySelectorAll(".wb-auto-seg-btn").forEach(b => {
+                    b.classList.toggle("active", b.dataset.val === val);
+                  });
+                };
+              });
+            });
+            const winPct = document.getElementById("wb-auto-on-win-pct");
+            if (winPct) winPct.onchange = e => {
+              config.autoOnWinPct = Math.max(0, parseFloat(e.target.value) || 0);
+              e.target.value = config.autoOnWinPct;
+              persistConfig();
+            };
+            const lossPct = document.getElementById("wb-auto-on-loss-pct");
+            if (lossPct) lossPct.onchange = e => {
+              config.autoOnLossPct = Math.max(0, parseFloat(e.target.value) || 0);
+              e.target.value = config.autoOnLossPct;
+              persistConfig();
+            };
+            const sp = document.getElementById("wb-auto-stop-profit");
+            if (sp) sp.onchange = e => {
+              config.autoStopProfit = Math.max(0, parseFloat(e.target.value) || 0);
+              e.target.value = config.autoStopProfit;
+              persistConfig();
+            };
+            const sl = document.getElementById("wb-auto-stop-loss");
+            if (sl) sl.onchange = e => {
+              config.autoStopLoss = Math.max(0, parseFloat(e.target.value) || 0);
+              e.target.value = config.autoStopLoss;
+              persistConfig();
+            };
+            const se = document.getElementById("wb-auto-seed-every");
+            if (se) se.onchange = e => {
+              config.autoSeedEvery = Math.max(0, Math.min(10000, parseInt(e.target.value, 10) || 0));
+              e.target.value = config.autoSeedEvery;
+              persistConfig();
+            };
+            const cs = document.getElementById("wb-auto-client-seed");
+            if (cs) cs.onchange = e => {
+              config.autoClientSeed = String(e.target.value || "").trim();
+              persistConfig();
+            };
+            const seedBtn = document.getElementById("wb-auto-seed-btn");
+            if (seedBtn) seedBtn.onclick = async () => {
+              const product = originalsProductForGame(state.activeOriginal || "keno");
+              seedBtn.disabled = true;
+              try {
+                await rotateOriginalsSeed(product, { silent: false });
+              } catch (err) {
+                toast("Seed: " + err.message, "error");
+              }
+              seedBtn.disabled = false;
+            };
           }
 
           function updateKenoLiveResult(r, i, total) {
@@ -7873,28 +8193,33 @@
               return;
             }
             const count = Math.max(1, Math.min(500, config.kenoAutoCount || 10));
+            const session = createAutoStratSession();
             state.keno.autoRunning = true;
             renderKenoPanel();
-            let wins = 0;
-            let pnl = 0;
             const t0 = Date.now();
             try {
               await resolveKenoCurrencyForBet();
               await ensureExchangeRate(true);
             } catch (err) {
               state.keno.autoRunning = false;
+              finishAutoStratSession(session);
               toast("Keno: " + err.message, "error");
               renderKenoPanel();
               return;
             }
             for (let i = 0; i < count && state.keno.autoRunning; i++) {
               try {
+                config.kenoStake = session.currentStake;
                 const r = await playKenoOnce({ fast: true, deferPersist: true });
-                if ((r.profit || 0) > 0) wins++;
-                pnl += r.profit || 0;
-                setStatus("Keno " + (i + 1) + "/" + count + " · x" + r.mult + " · " + r.hitCount + " hits", { quiet: true });
+                const cont = applyAutoStakeAfterResult(session, "keno", r);
+                setStatus("Keno " + (i + 1) + "/" + count + " · mise " + formatKenoAmt(r.stake) + " · x" + r.mult + " · PnL " + formatKenoAmt(session.sessionPnl), { quiet: true });
                 updateKenoLiveResult(r, i + 1, count);
+                await maybeAutoRotateSeed(session, "thrill-keno");
                 if ((i + 1) % 25 === 0) persistConfig();
+                if (!cont) {
+                  state.keno.autoRunning = false;
+                  break;
+                }
               } catch (err) {
                 toast("Keno: " + err.message, "error");
                 state.keno.autoRunning = false;
@@ -7908,8 +8233,10 @@
             persistConfig();
             state.keno.autoRunning = false;
             const sec = ((Date.now() - t0) / 1000).toFixed(1);
-            toast("Auto Keno · " + wins + " wins · PnL " + pnl.toFixed(6) + " " + getKenoCurrency() + " · " + sec + "s", wins ? "success" : "info");
-            setStatus("Keno auto terminé · " + sec + "s");
+            const stopTxt = session.stopReason ? " · stop " + session.stopReason : "";
+            toast("Auto Keno · " + session.wins + " wins · PnL " + formatKenoAmt(session.sessionPnl) + " " + getKenoCurrency() + " · " + sec + "s" + stopTxt, session.wins ? "success" : "info");
+            setStatus("Keno auto terminé · " + sec + "s" + stopTxt);
+            finishAutoStratSession(session);
             renderKenoPanel();
           }
 
@@ -8020,6 +8347,7 @@
                 <button class="wb-btn wb-btn-primary wb-btn-sm" id="wb-keno-play" ${state.keno.playing || state.keno.autoRunning ? "disabled" : ""}>Jouer</button>
                 <button class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-keno-auto">${state.keno.autoRunning ? "Stop auto" : "Auto play"}</button>
               </div>
+              ${autoStratHtml()}
               <div class="wb-keno-last" id="wb-keno-live">${lastLine}</div>
               <div class="wb-section-title">Bilan session </div>
               <div class="wb-keno-stats" id="wb-keno-stats">${renderKenoStatsHtml(stats)}</div>
@@ -8031,6 +8359,7 @@
             `;
 
             bindGamesNav(box);
+            bindAutoStrat(box);
             box.querySelectorAll(".wb-keno-cell").forEach(btn => {
               btn.onclick = () => toggleKenoSpot(btn.dataset.n);
             });
@@ -8105,12 +8434,13 @@
           // --- Originaux (Dice) ------------------------------------------------------
 
           function gamesNavHtml() {
-            const g = state.activeOriginal === "dice" ? "dice"
-              : (state.activeOriginal === "limbo" ? "limbo" : "keno");
+            const g = state.activeOriginal;
+            const is = (name) => g === name ? " active" : "";
             return `<div class="wb-game-nav">
-              <button type="button" class="wb-game-nav-btn${g === "keno" ? " active" : ""}" data-game="keno">Keno</button>
-              <button type="button" class="wb-game-nav-btn${g === "dice" ? " active" : ""}" data-game="dice">Dice</button>
-              <button type="button" class="wb-game-nav-btn${g === "limbo" ? " active" : ""}" data-game="limbo">Limbo</button>
+              <button type="button" class="wb-game-nav-btn${is("keno")}" data-game="keno">Keno</button>
+              <button type="button" class="wb-game-nav-btn${is("dice")}" data-game="dice">Dice</button>
+              <button type="button" class="wb-game-nav-btn${is("limbo")}" data-game="limbo">Limbo</button>
+              <button type="button" class="wb-game-nav-btn${is("mines")}" data-game="mines">Mines</button>
             </div>`;
           }
 
@@ -8119,7 +8449,7 @@
             root.querySelectorAll("[data-game]").forEach(btn => {
               btn.onclick = () => {
                 const g = btn.dataset.game;
-                const game = g === "dice" || g === "limbo" ? g : "keno";
+                const game = ["dice", "limbo", "mines"].includes(g) ? g : "keno";
                 state._originalPickAt = Date.now();
                 selectOriginalGame(game, { navigate: true });
               };
@@ -8129,6 +8459,7 @@
           function renderGamesPanel() {
             if (state.activeOriginal === "dice") renderDicePanel();
             else if (state.activeOriginal === "limbo") renderLimboPanel();
+            else if (state.activeOriginal === "mines") renderMinesPanel();
             else renderKenoPanel();
           }
 
@@ -8213,7 +8544,7 @@
             const walletStake = +Number(stake).toFixed(12);
             const anchorStake = +(walletStake / fx).toFixed(12);
 
-            return {
+            return attachClientSeed({
               inputInAnchorCurrency: false,
               walletCurrencyIsoCode: cur,
               anchorCurrencyIsoCode: "EUR",
@@ -8224,7 +8555,7 @@
               payoutMultiplier,
               gameMode: mode,
               playoutTimeMilliseconds: Math.max(0, Number(config.kenoPlayoutMs) || 0)
-            };
+            });
           }
 
           function summarizeDiceResult(data, betInfo) {
@@ -8386,28 +8717,33 @@
               return;
             }
             const count = Math.max(1, Math.min(500, config.kenoAutoCount || 10));
+            const session = createAutoStratSession();
             state.dice.autoRunning = true;
             renderDicePanel();
-            let wins = 0;
-            let pnl = 0;
             const t0 = Date.now();
             try {
               await resolveKenoCurrencyForBet();
               await ensureExchangeRate(true);
             } catch (err) {
               state.dice.autoRunning = false;
+              finishAutoStratSession(session);
               toast("Dice: " + err.message, "error");
               renderDicePanel();
               return;
             }
             for (let i = 0; i < count && state.dice.autoRunning; i++) {
               try {
+                config.kenoStake = session.currentStake;
                 const r = await playDiceOnce({ fast: true, deferPersist: true });
-                if ((r.profit || 0) > 0) wins++;
-                pnl += r.profit || 0;
-                setStatus("Dice " + (i + 1) + "/" + count + " · " + r.result + " · x" + r.mult, { quiet: true });
+                const cont = applyAutoStakeAfterResult(session, "dice", r);
+                setStatus("Dice " + (i + 1) + "/" + count + " · mise " + formatKenoAmt(r.stake) + " · " + r.result + " · PnL " + formatKenoAmt(session.sessionPnl), { quiet: true });
                 updateDiceLiveResult(r, i + 1, count);
+                await maybeAutoRotateSeed(session, "thrill-dice");
                 if ((i + 1) % 25 === 0) persistConfig();
+                if (!cont) {
+                  state.dice.autoRunning = false;
+                  break;
+                }
               } catch (err) {
                 toast("Dice: " + err.message, "error");
                 state.dice.autoRunning = false;
@@ -8421,8 +8757,10 @@
             persistConfig();
             state.dice.autoRunning = false;
             const sec = ((Date.now() - t0) / 1000).toFixed(1);
-            toast("Auto Dice · " + wins + " wins · PnL " + pnl.toFixed(6) + " " + getKenoCurrency() + " · " + sec + "s", wins ? "success" : "info");
-            setStatus("Dice auto terminé · " + sec + "s");
+            const stopTxt = session.stopReason ? " · stop " + session.stopReason : "";
+            toast("Auto Dice · " + session.wins + " wins · PnL " + formatKenoAmt(session.sessionPnl) + " " + getKenoCurrency() + " · " + sec + "s" + stopTxt, session.wins ? "success" : "info");
+            setStatus("Dice auto terminé · " + sec + "s" + stopTxt);
+            finishAutoStratSession(session);
             renderDicePanel();
           }
 
@@ -8497,6 +8835,7 @@
                 <button class="wb-btn wb-btn-primary wb-btn-sm" id="wb-dice-play" ${state.dice.playing || state.dice.autoRunning ? "disabled" : ""}>Jouer</button>
                 <button class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-dice-auto">${state.dice.autoRunning ? "Stop auto" : "Auto play"}</button>
               </div>
+              ${autoStratHtml()}
               <div class="wb-keno-last" id="wb-dice-live">${lastLine}</div>
               <div class="wb-section-title">Bilan (${cur})</div>
               <div class="wb-keno-stats" id="wb-dice-stats">${renderDiceStatsHtml(stats)}</div>
@@ -8508,6 +8847,7 @@
             `;
 
             bindGamesNav(box);
+            bindAutoStrat(box);
 
             const modeEl = document.getElementById("wb-dice-mode");
             if (modeEl) modeEl.onchange = e => {
@@ -8593,7 +8933,7 @@
             const walletStake = +Number(stake).toFixed(12);
             const anchorStake = +(walletStake / fx).toFixed(12);
 
-            return {
+            return attachClientSeed({
               inputInAnchorCurrency: false,
               walletCurrencyIsoCode: cur,
               anchorCurrencyIsoCode: "EUR",
@@ -8602,7 +8942,7 @@
               anchorNetStakeAmount: anchorStake,
               payoutMultiplier,
               playoutTimeMilliseconds: Math.max(0, Number(config.kenoPlayoutMs) || 0)
-            };
+            });
           }
 
           function summarizeLimboResult(data, betInfo) {
@@ -8760,28 +9100,33 @@
               return;
             }
             const count = Math.max(1, Math.min(500, config.kenoAutoCount || 10));
+            const session = createAutoStratSession();
             state.limbo.autoRunning = true;
             renderLimboPanel();
-            let wins = 0;
-            let pnl = 0;
             const t0 = Date.now();
             try {
               await resolveKenoCurrencyForBet();
               await ensureExchangeRate(true);
             } catch (err) {
               state.limbo.autoRunning = false;
+              finishAutoStratSession(session);
               toast("Limbo: " + err.message, "error");
               renderLimboPanel();
               return;
             }
             for (let i = 0; i < count && state.limbo.autoRunning; i++) {
               try {
+                config.kenoStake = session.currentStake;
                 const r = await playLimboOnce({ fast: true, deferPersist: true });
-                if ((r.profit || 0) > 0) wins++;
-                pnl += r.profit || 0;
-                setStatus("Limbo " + (i + 1) + "/" + count + " · " + r.result + " · x" + r.target, { quiet: true });
+                const cont = applyAutoStakeAfterResult(session, "limbo", r);
+                setStatus("Limbo " + (i + 1) + "/" + count + " · mise " + formatKenoAmt(r.stake) + " · x" + r.target + " · PnL " + formatKenoAmt(session.sessionPnl), { quiet: true });
                 updateLimboLiveResult(r, i + 1, count);
+                await maybeAutoRotateSeed(session, "thrill-limbo");
                 if ((i + 1) % 25 === 0) persistConfig();
+                if (!cont) {
+                  state.limbo.autoRunning = false;
+                  break;
+                }
               } catch (err) {
                 toast("Limbo: " + err.message, "error");
                 state.limbo.autoRunning = false;
@@ -8795,8 +9140,10 @@
             persistConfig();
             state.limbo.autoRunning = false;
             const sec = ((Date.now() - t0) / 1000).toFixed(1);
-            toast("Auto Limbo · " + wins + " wins · PnL " + pnl.toFixed(6) + " " + getKenoCurrency() + " · " + sec + "s", wins ? "success" : "info");
-            setStatus("Limbo auto terminé · " + sec + "s");
+            const stopTxt = session.stopReason ? " · stop " + session.stopReason : "";
+            toast("Auto Limbo · " + session.wins + " wins · PnL " + formatKenoAmt(session.sessionPnl) + " " + getKenoCurrency() + " · " + sec + "s" + stopTxt, session.wins ? "success" : "info");
+            setStatus("Limbo auto terminé · " + sec + "s" + stopTxt);
+            finishAutoStratSession(session);
             renderLimboPanel();
           }
 
@@ -8860,6 +9207,7 @@
                 <button class="wb-btn wb-btn-primary wb-btn-sm" id="wb-limbo-play" ${state.limbo.playing || state.limbo.autoRunning ? "disabled" : ""}>Jouer</button>
                 <button class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-limbo-auto">${state.limbo.autoRunning ? "Stop auto" : "Auto play"}</button>
               </div>
+              ${autoStratHtml()}
               <div class="wb-keno-last" id="wb-limbo-live">${lastLine}</div>
               <div class="wb-section-title">Bilan (${cur})</div>
               <div class="wb-keno-stats" id="wb-limbo-stats">${renderLimboStatsHtml(stats)}</div>
@@ -8871,6 +9219,7 @@
             `;
 
             bindGamesNav(box);
+            bindAutoStrat(box);
 
             const multEl = document.getElementById("wb-limbo-mult");
             if (multEl) multEl.onchange = e => {
@@ -8928,6 +9277,659 @@
               renderLimboPanel();
             };
             document.getElementById("wb-limbo-auto").onclick = () => runLimboAuto();
+          }
+
+          // --- Originaux (Mines) -----------------------------------------------------
+
+          function clampMinesEdge(raw) {
+            let e = parseInt(raw, 10);
+            // Thrill Mines : 5×5 (25), 6×6 (36), 7×7 (49), 8×8 (64)
+            if (!Number.isFinite(e) || e < 5) e = MINES_EDGE_DEFAULT;
+            if (e > 8) e = 8;
+            return e;
+          }
+
+          function minesTileCount(edge) {
+            const e = clampMinesEdge(edge != null ? edge : config.minesEdge);
+            return e * e;
+          }
+
+          function clampMinesCount(raw, edge) {
+            const e = clampMinesEdge(edge != null ? edge : config.minesEdge);
+            const max = minesTileCount(e) - 1;
+            let n = parseInt(raw, 10);
+            if (!Number.isFinite(n) || n < 1) n = 3;
+            if (n > max) n = max;
+            return n;
+          }
+
+          function clampMinesReveal(raw, mines, edge) {
+            const e = clampMinesEdge(edge != null ? edge : config.minesEdge);
+            const m = clampMinesCount(mines != null ? mines : config.minesCount, e);
+            const maxGems = minesTileCount(e) - m;
+            let n = parseInt(raw, 10);
+            if (!Number.isFinite(n) || n < 1) n = 1;
+            if (n > maxGems) n = maxGems;
+            return n;
+          }
+
+          function normalizeMinesConfig() {
+            const edge = clampMinesEdge(config.minesEdge);
+            const mines = clampMinesCount(config.minesCount, edge);
+            const tilesTotal = minesTileCount(edge);
+            const maxGems = tilesTotal - mines;
+            // garder uniquement les cases valides pour la grille courante
+            if (!Array.isArray(state.mines.tiles)) state.mines.tiles = [];
+            state.mines.tiles = state.mines.tiles
+              .map(Number)
+              .filter(n => Number.isFinite(n) && n >= 0 && n < tilesTotal);
+            // dédoublonner en gardant l'ordre de sélection
+            const seen = new Set();
+            state.mines.tiles = state.mines.tiles.filter(n => {
+              if (seen.has(n)) return false;
+              seen.add(n);
+              return true;
+            });
+            if (state.mines.tiles.length > maxGems) {
+              state.mines.tiles = state.mines.tiles.slice(0, maxGems);
+            }
+            const reveal = state.mines.tiles.length > 0
+              ? state.mines.tiles.length
+              : clampMinesReveal(config.minesReveal, mines, edge);
+            config.minesEdge = edge;
+            config.minesCount = mines;
+            config.minesReveal = reveal;
+            return { edge, mines, reveal, tiles: tilesTotal, maxGems };
+          }
+
+          function pickMinesTiles(count, total) {
+            const idxs = [];
+            for (let i = 0; i < total; i++) idxs.push(i);
+            for (let i = idxs.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              const t = idxs[i]; idxs[i] = idxs[j]; idxs[j] = t;
+            }
+            return idxs.slice(0, Math.max(0, Math.min(count, total)));
+          }
+
+          function resolveMinesTilesToReveal(cfg, opts) {
+            opts = opts || {};
+            if (opts.randomTiles) {
+              const n = clampMinesReveal(
+                opts.randomCount != null ? opts.randomCount : (config.minesAutoRandomCount || cfg.reveal || 1),
+                cfg.mines,
+                cfg.edge
+              );
+              return pickMinesTiles(n, cfg.tiles);
+            }
+            const selected = (state.mines.tiles || [])
+              .map(Number)
+              .filter(n => Number.isFinite(n) && n >= 0 && n < cfg.tiles);
+            if (selected.length > 0) return selected.slice();
+            return pickMinesTiles(cfg.reveal, cfg.tiles);
+          }
+
+          function toggleMinesTile(idx) {
+            idx = Number(idx);
+            const cfg = normalizeMinesConfig();
+            if (!Number.isFinite(idx) || idx < 0 || idx >= cfg.tiles) return;
+            const list = state.mines.tiles;
+            const pos = list.indexOf(idx);
+            if (pos >= 0) {
+              list.splice(pos, 1);
+            } else {
+              if (list.length >= cfg.maxGems) {
+                toast("Max " + cfg.maxGems + " cases (gemmes dispo)", "warning");
+                return;
+              }
+              list.push(idx);
+            }
+            config.minesReveal = list.length || 1;
+            persistConfig();
+            renderMinesPanel();
+          }
+
+          function randomMinesTiles(count) {
+            const cfg = normalizeMinesConfig();
+            const n = Math.max(1, Math.min(cfg.maxGems, count != null ? count : (cfg.reveal || 1)));
+            state.mines.tiles = pickMinesTiles(n, cfg.tiles);
+            config.minesReveal = state.mines.tiles.length;
+            persistConfig();
+            renderMinesPanel();
+          }
+
+          function clearMinesTiles() {
+            state.mines.tiles = [];
+            config.minesReveal = 1;
+            persistConfig();
+            renderMinesPanel();
+          }
+
+          function buildMinesPayload(rate) {
+            const stake = Math.max(0, Number(config.kenoStake) || 0);
+            const fx = Number(rate);
+            const cur = getKenoCurrency();
+            if (!Number.isFinite(fx) || fx <= 0) throw new Error("Taux FX invalide");
+            if (fx === 1 && cur !== "EUR") throw new Error("Taux FX invalide (1.0)");
+
+            const { edge, mines } = normalizeMinesConfig();
+            const walletStake = +Number(stake).toFixed(12);
+            const anchorStake = +(walletStake / fx).toFixed(12);
+
+            return attachClientSeed({
+              inputInAnchorCurrency: false,
+              walletCurrencyIsoCode: cur,
+              anchorCurrencyIsoCode: "EUR",
+              anchorToWalletExchangeRate: fx,
+              walletNetStakeAmount: walletStake,
+              anchorNetStakeAmount: anchorStake,
+              edgeSize: edge,
+              numberOfMines: mines,
+              insurancePercent: 0
+            });
+          }
+
+          function summarizeMinesResult(data, betInfo, extra) {
+            const d = data?.data || data || {};
+            const mult = Number(d.wonMultiplier) || 0;
+            const wonWallet = d.wonWalletGrossAmount != null ? Number(d.wonWalletGrossAmount) : null;
+            const stakeWallet = Number(betInfo?.walletStake != null ? betInfo.walletStake : config.kenoStake) || 0;
+            const hit = !!(extra && extra.hit);
+            const gems = Number(extra && extra.gems != null ? extra.gems : 0) || 0;
+            const payout = hit ? 0 : (wonWallet != null ? wonWallet : mult * stakeWallet);
+            const profit = payout - stakeWallet;
+            return {
+              roundId: d.roundId || (extra && extra.roundId) || "",
+              mult: hit ? 0 : mult,
+              gems,
+              mines: betInfo?.mines != null ? betInfo.mines : config.minesCount,
+              revealTarget: betInfo?.reveal != null ? betInfo.reveal : config.minesReveal,
+              hit,
+              wonWallet: payout,
+              stake: stakeWallet,
+              profit,
+              currency: getKenoCurrency(),
+              ts: Date.now()
+            };
+          }
+
+          function pushMinesHistory(summary, opts) {
+            state.mines.lastResult = summary;
+            state.mines.history.unshift(summary);
+            if (state.mines.history.length > HIST_STORE_LIMIT) state.mines.history.length = HIST_STORE_LIMIT;
+            if (!opts || opts.persist !== false) persistConfig();
+          }
+
+          function computeMinesStats(list) {
+            const rows = list || state.mines.history || [];
+            const cur = getKenoCurrency();
+            const scoped = rows.filter(h => !h.currency || h.currency === cur);
+            let wagered = 0, returned = 0, wins = 0, bestMult = 0, bestGems = 0;
+            for (const h of scoped) {
+              const stake = Number(h.stake) || 0;
+              const payout = h.wonWallet != null ? Number(h.wonWallet) : ((Number(h.mult) || 0) * stake);
+              const profit = h.profit != null ? Number(h.profit) : payout - stake;
+              wagered += stake;
+              returned += payout;
+              if (profit > 0 && !h.hit) wins++;
+              if ((Number(h.mult) || 0) > bestMult) bestMult = Number(h.mult) || 0;
+              if ((Number(h.gems) || 0) > bestGems) bestGems = Number(h.gems) || 0;
+            }
+            const spins = scoped.length;
+            return {
+              spins,
+              wins,
+              losses: Math.max(0, spins - wins),
+              winRate: spins ? Math.round(wins / spins * 100) : 0,
+              wagered,
+              returned,
+              profit: returned - wagered,
+              bestMult,
+              bestGems,
+              currency: cur
+            };
+          }
+
+          function renderMinesStatsHtml(s) {
+            const pnlCls = s.profit > 0 ? "ok" : (s.profit < 0 ? "err" : "");
+            return `
+              <div class="wb-keno-stat"><span class="k">Rounds</span><span class="v">${s.spins}</span></div>
+              <div class="wb-keno-stat"><span class="k">Wins</span><span class="v" style="color:var(--wb-green)">${s.wins}</span></div>
+              <div class="wb-keno-stat"><span class="k">Winrate</span><span class="v">${s.winRate}%</span></div>
+              <div class="wb-keno-stat"><span class="k">Best</span><span class="v">x${formatKenoAmt(s.bestMult, 2)} · ${s.bestGems}g</span></div>
+              <div class="wb-keno-stat"><span class="k">Misés</span><span class="v">${formatKenoAmt(s.wagered)} ${s.currency}</span></div>
+              <div class="wb-keno-stat"><span class="k">Retours</span><span class="v">${formatKenoAmt(s.returned)} ${s.currency}</span></div>
+              <div class="wb-keno-stat wide ${pnlCls}"><span class="k">Profit</span><span class="v">${s.profit >= 0 ? "+" : ""}${formatKenoAmt(s.profit)} ${s.currency}</span></div>
+            `;
+          }
+
+          function updateMinesLiveResult(r, i, total) {
+            const live = document.getElementById("wb-mines-live");
+            if (live) {
+              const sign = (r.profit || 0) >= 0 ? "+" : "";
+              live.textContent = (total ? i + "/" + total + " · " : "") +
+                (r.hit ? "MINE" : r.gems + " gem(s)") + " · x" + (r.mult || 0) + " · " +
+                sign + formatKenoAmt(r.profit) + " " + (r.currency || getKenoCurrency());
+            }
+            if (!total || i === total || i % 5 === 0) {
+              const statsBox = document.getElementById("wb-mines-stats");
+              if (statsBox) statsBox.innerHTML = renderMinesStatsHtml(computeMinesStats());
+            }
+            if (state.mines.history.length) {
+              const h = state.mines.history[0];
+              const profit = Number(h.profit) || 0;
+              const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
+              const row = document.createElement("div");
+              row.className = "wb-keno-hist " + cls;
+              row.innerHTML = `
+                <div class="wb-keno-hist-top">
+                  <span>${h.hit ? "MINE" : "OK"} ${h.mines}m · ${h.gems}/${h.revealTarget} · x${h.mult}</span>
+                  <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || getKenoCurrency()}</span>
+                </div>
+                <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
+              `;
+              prependHistRow("wb-mines-hist", row);
+            }
+          }
+
+          function minesApiError(status, data, body) {
+            if (status >= 400 || (data && data.responseCode && data.responseCode !== "OK")) {
+              const errMsg = data?.message || data?.error || data?.responseCode || ("HTTP " + status);
+              if (/exchange rate is invalid/i.test(String(errMsg))) {
+                clearExchangeRate();
+                throw new Error("Taux FX rejeté par Thrill — nouvel essai au prochain spin");
+              }
+              if (/insufficient|not enough|balance|fonds|pas assez|argent/i.test(String(errMsg))) {
+                throw new Error("Solde " + getKenoCurrency() + " insuffisant (mise " +
+                  (body && body.walletNetStakeAmount != null ? body.walletNetStakeAmount : "?") + " " + getKenoCurrency() + ")");
+              }
+              throw new Error(String(errMsg));
+            }
+          }
+
+          async function postMinesAction(path, body, opts) {
+            opts = opts || {};
+            return postGameBet(path, "thrill-mines", body, { preferDirect: !!opts.fast });
+          }
+
+          async function playMinesOnce(opts) {
+            opts = opts || {};
+            activatePlayerTokenForGame("mines");
+            if (!getPlayerTokenForProduct("thrill-mines")) {
+              if (!isOnOriginalsGamePage("mines")) {
+                selectOriginalGame("mines", { navigate: true });
+                throw new Error("Ouverture Mines pour sync token — reclique Jouer ensuite");
+              }
+              throw new Error("Token joueur manquant — ouvre Mines une fois sur thrill.com");
+            }
+
+            const cfg = normalizeMinesConfig();
+            const useRandom = !!(opts.randomTiles || (opts.auto && config.minesAutoRandom));
+            const tiles = resolveMinesTilesToReveal(cfg, {
+              randomTiles: useRandom,
+              randomCount: config.minesAutoRandomCount
+            });
+            if (!tiles.length) {
+              throw new Error(useRandom
+                ? "Random: nombre de cases invalide"
+                : "Sélectionne au moins 1 case sur la grille");
+            }
+            if (useRandom) {
+              state.mines.tiles = tiles.slice();
+              config.minesReveal = tiles.length;
+            }
+            if (!opts.fast) await resolveKenoCurrencyForBet();
+            let rate = await ensureExchangeRate(!!opts.forceFx, opts.fast ? 300000 : 60000);
+            let body = buildMinesPayload(rate);
+
+            let { status, data } = await postMinesAction("/v1/mines/bet", body, opts);
+            const msg = String(data?.message || data?.error || data?.responseCode || "");
+            const invalidFx = /exchange rate is invalid/i.test(msg) || /invalid.*exchange/i.test(msg);
+            if (invalidFx) {
+              clearExchangeRate();
+              rate = await ensureExchangeRate(true);
+              body = buildMinesPayload(rate);
+              ({ status, data } = await postMinesAction("/v1/mines/bet", body, opts));
+            }
+            minesApiError(status, data, body);
+
+            const betData = data?.data || data || {};
+            const roundId = betData.roundId;
+            if (!roundId) throw new Error("Mines: roundId manquant après bet");
+
+            let gems = 0;
+            let lastReveal = null;
+            let hit = false;
+            let wonMult = Number(betData.nextWinMultiplier) || 0;
+
+            for (let i = 0; i < tiles.length; i++) {
+              const revealBody = { tileIndex: tiles[i], roundId };
+              const rev = await postMinesAction("/v1/mines/reveal", revealBody, opts);
+              minesApiError(rev.status, rev.data, revealBody);
+              lastReveal = rev.data?.data || rev.data || {};
+              const tileLabel = String(lastReveal.revealedTile || "");
+              const isGem = /gem/i.test(tileLabel) ||
+                (Array.isArray(lastReveal.tilesStatus) && lastReveal.tilesStatus[tiles[i]] && lastReveal.tilesStatus[tiles[i]].isGem === true);
+
+              if (!isGem) {
+                hit = true;
+                wonMult = 0;
+                break;
+              }
+              gems++;
+              wonMult = Number(lastReveal.wonMultiplier) || wonMult;
+              if (lastReveal.isConcluded) break;
+            }
+
+            let cashData = lastReveal;
+            if (!hit && gems > 0 && !(lastReveal && lastReveal.isConcluded)) {
+              const cashBody = { roundId };
+              const cash = await postMinesAction("/v1/mines/cashout", cashBody, opts);
+              minesApiError(cash.status, cash.data, cashBody);
+              cashData = cash.data?.data || cash.data || lastReveal || {};
+              wonMult = Number(cashData.wonMultiplier) || wonMult;
+            } else if (!hit && lastReveal && lastReveal.isConcluded) {
+              cashData = lastReveal;
+              wonMult = Number(lastReveal.wonMultiplier) || wonMult;
+            } else if (!hit && gems === 0) {
+              // aucun reveal — cashout immédiat (mise ×1)
+              try {
+                const cashBody = { roundId };
+                const cash = await postMinesAction("/v1/mines/cashout", cashBody, opts);
+                if (!(cash.status >= 400 || (cash.data && cash.data.responseCode && cash.data.responseCode !== "OK"))) {
+                  cashData = cash.data?.data || cash.data || {};
+                  wonMult = Number(cashData.wonMultiplier) || 1;
+                }
+              } catch {}
+            }
+
+            const summary = summarizeMinesResult(
+              { data: Object.assign({}, cashData || {}, { roundId, wonMultiplier: hit ? 0 : wonMult }) },
+              {
+                walletStake: Number(body.walletNetStakeAmount) || 0,
+                mines: cfg.mines,
+                reveal: cfg.reveal
+              },
+              { hit, gems, roundId }
+            );
+            pushMinesHistory(summary, { persist: !opts.deferPersist });
+            return summary;
+          }
+
+          async function runMinesAuto() {
+            if (state.mines.autoRunning) {
+              state.mines.autoRunning = false;
+              renderMinesPanel();
+              return;
+            }
+            const count = Math.max(1, Math.min(500, config.kenoAutoCount || 10));
+            const session = createAutoStratSession();
+            state.mines.autoRunning = true;
+            renderMinesPanel();
+            const t0 = Date.now();
+            try {
+              await resolveKenoCurrencyForBet();
+              await ensureExchangeRate(true);
+            } catch (err) {
+              state.mines.autoRunning = false;
+              finishAutoStratSession(session);
+              toast("Mines: " + err.message, "error");
+              renderMinesPanel();
+              return;
+            }
+            for (let i = 0; i < count && state.mines.autoRunning; i++) {
+              try {
+                if (!config.minesAutoRandom && !(state.mines.tiles && state.mines.tiles.length)) {
+                  throw new Error("Sélectionne au moins 1 case (ou active Auto random)");
+                }
+                config.kenoStake = session.currentStake;
+                const r = await playMinesOnce({
+                  fast: true,
+                  deferPersist: true,
+                  auto: true,
+                  randomTiles: !!config.minesAutoRandom
+                });
+                const cont = applyAutoStakeAfterResult(session, "mines", r);
+                setStatus("Mines " + (i + 1) + "/" + count + " · mise " + formatKenoAmt(r.stake) + " · " + (r.hit ? "mine" : r.gems + " gems") + " · PnL " + formatKenoAmt(session.sessionPnl), { quiet: true });
+                updateMinesLiveResult(r, i + 1, count);
+                await maybeAutoRotateSeed(session, "thrill-mines");
+                if ((i + 1) % 25 === 0) persistConfig();
+                if (!cont) {
+                  state.mines.autoRunning = false;
+                  break;
+                }
+              } catch (err) {
+                toast("Mines: " + err.message, "error");
+                state.mines.autoRunning = false;
+                break;
+              }
+              if (i < count - 1 && state.mines.autoRunning) {
+                const delay = Math.max(0, Number(config.kenoAutoDelayMs) || 0);
+                if (delay > 0) await new Promise(r => setTimeout(r, delay));
+              }
+            }
+            persistConfig();
+            state.mines.autoRunning = false;
+            const sec = ((Date.now() - t0) / 1000).toFixed(1);
+            const stopTxt = session.stopReason ? " · stop " + session.stopReason : "";
+            toast("Auto Mines · " + session.wins + " wins · PnL " + formatKenoAmt(session.sessionPnl) + " " + getKenoCurrency() + " · " + sec + "s" + stopTxt, session.wins ? "success" : "info");
+            setStatus("Mines auto terminé · " + sec + "s" + stopTxt);
+            finishAutoStratSession(session);
+            renderMinesPanel();
+          }
+
+          function renderMinesPanel() {
+            const box = document.getElementById("wb-games");
+            if (!box) return;
+            const cur = getKenoCurrency();
+            const cfg = normalizeMinesConfig();
+            const stats = computeMinesStats();
+            const last = state.mines.lastResult;
+            const picked = new Set(state.mines.tiles || []);
+            const pickOrder = {};
+            (state.mines.tiles || []).forEach((t, i) => { pickOrder[t] = i + 1; });
+
+            const cells = Array.from({ length: cfg.tiles }, (_, i) => {
+              let cls = "wb-keno-cell wb-mines-cell";
+              if (picked.has(i)) cls += " pick";
+              const label = picked.has(i) ? pickOrder[i] : (i + 1);
+              return `<button type="button" class="${cls}" data-idx="${i}" title="Case ${i}">${label}</button>`;
+            }).join("");
+
+            const histRows = state.mines.history.slice(0, HIST_UI_LIMIT).map(h => {
+              const profit = Number(h.profit) || 0;
+              const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
+              return `<div class="wb-keno-hist ${cls}">
+                <div class="wb-keno-hist-top">
+                  <span>${h.hit ? "MINE" : "OK"} ${h.mines}m · ${h.gems}/${h.revealTarget} · x${h.mult}</span>
+                  <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || cur}</span>
+                </div>
+                <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
+              </div>`;
+            }).join("");
+
+            const lastLine = last
+              ? `Dernier · ${last.hit ? "MINE" : last.gems + " gem(s)"} · x${last.mult} · ${(last.profit || 0) >= 0 ? "+" : ""}${formatKenoAmt(last.profit)} ${last.currency || cur}`
+              : "En attente d'un round…";
+
+            box.innerHTML = `
+              ${gamesNavHtml()}
+              <div class="wb-games-head">
+                <div>
+                  <div class="wb-section-title" style="margin:0 0 4px">Mines</div>
+                  <div style="font-size:11px;color:var(--wb-muted)">Crypto auto · ${cur} · ${cfg.edge}×${cfg.edge} · ${cfg.mines} mines · ${config.minesAutoRandom ? ("random ×" + (config.minesAutoRandomCount || 1)) : (picked.size + " case(s)")}</div>
+                </div>
+              </div>
+              <div class="wb-mines-grid" style="grid-template-columns:repeat(${cfg.edge},1fr)">${cells}</div>
+              <div class="wb-keno-toolbar">
+                <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-rand1">R1</button>
+                <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-rand3">R3</button>
+                <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-rand5">R5</button>
+                <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-clear">Vider</button>
+                <span style="font-size:11px;color:var(--wb-muted);margin-left:auto">${picked.size}/${cfg.maxGems}</span>
+              </div>
+              <div class="wb-actions" style="margin-top:8px">
+                <button class="wb-btn wb-btn-primary wb-btn-sm" id="wb-mines-play" ${state.mines.playing || state.mines.autoRunning ? "disabled" : ""}>Jouer</button>
+                <button class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-auto">${state.mines.autoRunning ? "Stop auto" : "Auto play"}</button>
+              </div>
+              <details class="wb-fold" id="wb-mines-settings-fold"${config.minesSettingsOpen ? " open" : ""}>
+                <summary class="wb-fold-summary">
+                  <span>Réglages Mines</span>
+                  <span class="wb-fold-hint">${cfg.mines}m · mise ${formatKenoAmt(config.kenoStake)} · auto ×${config.kenoAutoCount}</span>
+                </summary>
+                <div class="wb-keno-controls" style="margin-top:8px">
+                  <label>Mines
+                    <input id="wb-mines-count" type="number" min="1" max="${cfg.tiles - 1}" value="${cfg.mines}"/>
+                  </label>
+                  <label>Mise (${cur})
+                    <input id="wb-mines-stake" type="number" min="0" step="any" value="${config.kenoStake}"/>
+                  </label>
+                  <label>Grille
+                    <select id="wb-mines-edge">
+                      <option value="5"${cfg.edge === 5 ? " selected" : ""}>5×5 (25)</option>
+                      <option value="6"${cfg.edge === 6 ? " selected" : ""}>6×6 (36)</option>
+                      <option value="7"${cfg.edge === 7 ? " selected" : ""}>7×7 (49)</option>
+                      <option value="8"${cfg.edge === 8 ? " selected" : ""}>8×8 (64)</option>
+                    </select>
+                  </label>
+                  <label>Auto ×
+                    <input id="wb-mines-auto-count" type="number" min="1" max="500" value="${config.kenoAutoCount}"/>
+                  </label>
+                  <label>Auto cases
+                    <select id="wb-mines-auto-pick">
+                      <option value="fixed"${!config.minesAutoRandom ? " selected" : ""}>Fixes (grille)</option>
+                      <option value="random"${config.minesAutoRandom ? " selected" : ""}>Random chaque round</option>
+                    </select>
+                  </label>
+                  <label>Random ×
+                    <input id="wb-mines-auto-rand-count" type="number" min="1" max="${cfg.maxGems}" value="${Math.max(1, Math.min(cfg.maxGems, config.minesAutoRandomCount || 1))}"/>
+                  </label>
+                  <label>Vitesse
+                    <select id="wb-mines-speed">
+                      <option value="instant"${config.kenoSpeed === "instant" ? " selected" : ""}>Instant (0 ms)</option>
+                      <option value="fast"${config.kenoSpeed === "fast" ? " selected" : ""}>Rapide (30 ms)</option>
+                      <option value="normal"${config.kenoSpeed === "normal" ? " selected" : ""}>Normal (150 ms)</option>
+                      <option value="custom"${config.kenoSpeed === "custom" ? " selected" : ""}>Perso</option>
+                    </select>
+                  </label>
+                  <label>Delay ms
+                    <input id="wb-mines-auto-delay" type="number" min="0" max="5000" value="${config.kenoAutoDelayMs}"/>
+                  </label>
+                </div>
+              </details>
+              ${autoStratHtml()}
+              <div class="wb-keno-last" id="wb-mines-live">${lastLine}</div>
+              <div class="wb-section-title">Bilan (${cur})</div>
+              <div class="wb-keno-stats" id="wb-mines-stats">${renderMinesStatsHtml(stats)}</div>
+              <div class="wb-section-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                <span>Historique gains</span>
+                <button type="button" class="wb-btn wb-btn-ghost wb-btn-sm" id="wb-mines-clear-hist" style="color:var(--wb-red)">Vider</button>
+              </div>
+              <div class="wb-keno-hist-list" id="wb-mines-hist">${histRows || '<div class="wb-empty" style="padding:12px">Aucun round encore</div>'}</div>
+            `;
+
+            bindGamesNav(box);
+            bindAutoStrat(box);
+
+            const settingsFold = document.getElementById("wb-mines-settings-fold");
+            if (settingsFold) {
+              settingsFold.open = !!config.minesSettingsOpen;
+              settingsFold.ontoggle = () => {
+                config.minesSettingsOpen = !!settingsFold.open;
+                persistConfig();
+              };
+            }
+
+            box.querySelectorAll(".wb-mines-cell").forEach(btn => {
+              btn.onclick = () => toggleMinesTile(btn.dataset.idx);
+            });
+            document.getElementById("wb-mines-rand1").onclick = () => randomMinesTiles(1);
+            document.getElementById("wb-mines-rand3").onclick = () => randomMinesTiles(3);
+            document.getElementById("wb-mines-rand5").onclick = () => randomMinesTiles(5);
+            document.getElementById("wb-mines-clear").onclick = () => clearMinesTiles();
+
+            const countEl = document.getElementById("wb-mines-count");
+            if (countEl) countEl.onchange = e => {
+              config.minesCount = clampMinesCount(e.target.value, config.minesEdge);
+              normalizeMinesConfig();
+              e.target.value = config.minesCount;
+              persistConfig();
+              renderMinesPanel();
+            };
+            const edgeEl = document.getElementById("wb-mines-edge");
+            if (edgeEl) edgeEl.onchange = e => {
+              config.minesEdge = clampMinesEdge(e.target.value);
+              normalizeMinesConfig();
+              persistConfig();
+              renderMinesPanel();
+            };
+            const stakeEl = document.getElementById("wb-mines-stake");
+            if (stakeEl) stakeEl.onchange = e => {
+              config.kenoStake = Math.max(0, parseFloat(e.target.value) || 0);
+              persistConfig();
+            };
+            const ac = document.getElementById("wb-mines-auto-count");
+            if (ac) ac.onchange = e => {
+              config.kenoAutoCount = Math.max(1, Math.min(500, parseInt(e.target.value, 10) || 10));
+              e.target.value = config.kenoAutoCount;
+              persistConfig();
+            };
+            const pickMode = document.getElementById("wb-mines-auto-pick");
+            if (pickMode) pickMode.onchange = e => {
+              config.minesAutoRandom = e.target.value === "random";
+              persistConfig();
+              renderMinesPanel();
+            };
+            const randCount = document.getElementById("wb-mines-auto-rand-count");
+            if (randCount) randCount.onchange = e => {
+              const cfg2 = normalizeMinesConfig();
+              config.minesAutoRandomCount = clampMinesReveal(e.target.value, cfg2.mines, cfg2.edge);
+              e.target.value = config.minesAutoRandomCount;
+              persistConfig();
+            };
+            const speedEl = document.getElementById("wb-mines-speed");
+            if (speedEl) speedEl.onchange = e => {
+              if (e.target.value === "custom") {
+                config.kenoSpeed = "custom";
+                persistConfig();
+              } else {
+                applyKenoSpeedPreset(e.target.value);
+              }
+            };
+            const ad = document.getElementById("wb-mines-auto-delay");
+            if (ad) ad.onchange = e => {
+              config.kenoAutoDelayMs = Math.max(0, Math.min(5000, parseInt(e.target.value, 10) || 0));
+              e.target.value = config.kenoAutoDelayMs;
+              config.kenoSpeed = "custom";
+              persistConfig();
+            };
+            document.getElementById("wb-mines-clear-hist").onclick = () => {
+              if (!confirm("Vider l'historique Mines et le bilan ?")) return;
+              state.mines.history = [];
+              state.mines.lastResult = null;
+              persistConfig();
+              renderMinesPanel();
+            };
+            document.getElementById("wb-mines-play").onclick = async () => {
+              if (state.mines.playing || state.mines.autoRunning) return;
+              if (!(state.mines.tiles && state.mines.tiles.length)) {
+                toast("Sélectionne au moins 1 case", "warning");
+                return;
+              }
+              state.mines.playing = true;
+              renderMinesPanel();
+              try {
+                const r = await playMinesOnce();
+                const label = r.hit ? "MINE" : (r.gems + " gems · x" + r.mult);
+                toast("Mines " + label + " · " + ((r.profit || 0) >= 0 ? "+" : "") + formatKenoAmt(r.profit) + " " + getKenoCurrency(), r.profit > 0 ? "success" : "info");
+                setStatus("Mines " + label);
+              } catch (err) {
+                toast("Mines: " + err.message, "error");
+              }
+              state.mines.playing = false;
+              renderMinesPanel();
+            };
+            document.getElementById("wb-mines-auto").onclick = () => runMinesAuto();
           }
 
           // --- Claim engine ----------------------------------------------------------
@@ -9226,11 +10228,13 @@
               .wb-toast.warning{border-color:rgba(251,191,36,.4)}
               .wb-btn:disabled{opacity:.45;cursor:not-allowed;transform:none!important}
               #wb-games{padding:12px 14px 20px}
-              .wb-game-nav{display:flex;gap:6px;margin-bottom:12px}
-              .wb-game-nav-btn{flex:1;padding:8px 10px;border-radius:8px;border:1px solid var(--wb-border);background:var(--wb-surface);color:var(--wb-muted);font:600 12px 'Space Grotesk',sans-serif;cursor:pointer}
+              .wb-game-nav{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
+              .wb-game-nav-btn{flex:1;min-width:0;padding:8px 6px;border-radius:8px;border:1px solid var(--wb-border);background:var(--wb-surface);color:var(--wb-muted);font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
               .wb-game-nav-btn.active{color:#fff;border-color:rgba(168,85,247,.55);background:rgba(168,85,247,.18)}
               .wb-games-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:12px}
               .wb-keno-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:5px;margin-bottom:10px}
+              .wb-mines-grid{display:grid;gap:3px;margin:0 auto 8px;max-width:260px;width:100%}
+              .wb-mines-grid .wb-mines-cell{aspect-ratio:1;border-radius:5px;font:600 8px 'JetBrains Mono',monospace;min-height:0}
               .wb-keno-cell{aspect-ratio:1;border-radius:8px;border:1px solid rgba(255,255,255,.08);background:var(--wb-surface);color:#c4b5d8;font:600 11px 'JetBrains Mono',monospace;cursor:pointer;padding:0}
               .wb-keno-cell:hover{border-color:rgba(168,85,247,.4)}
               .wb-keno-cell.pick{background:rgba(168,85,247,.22);border-color:rgba(168,85,247,.55);color:#fff}
@@ -9257,6 +10261,24 @@
               .wb-keno-hist.ok .pnl{color:var(--wb-green)}
               .wb-keno-hist.err{border-color:rgba(248,113,113,.2)}
               .wb-keno-hist.err .pnl{color:var(--wb-red)}
+              .wb-fold{margin-top:10px;border-radius:10px;border:1px solid var(--wb-border);background:var(--wb-surface);overflow:hidden}
+              .wb-fold-summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;cursor:pointer;list-style:none;font:600 11px 'Space Grotesk',sans-serif;color:#d8cce8;user-select:none}
+              .wb-fold-summary::-webkit-details-marker{display:none}
+              .wb-fold-summary::after{content:"▸";color:var(--wb-muted);font-size:12px;transition:transform .15s}
+              .wb-fold[open] > .wb-fold-summary::after{transform:rotate(90deg)}
+              .wb-fold-hint{font:500 10px 'JetBrains Mono',monospace;color:var(--wb-muted);margin-left:auto;margin-right:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+              .wb-auto-strat{padding:10px 12px 12px;border-top:1px solid rgba(255,255,255,.05)}
+              .wb-auto-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px}
+              .wb-auto-label{flex:0 0 100%;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--wb-muted)}
+              .wb-auto-seg{display:inline-flex;border-radius:8px;overflow:hidden;border:1px solid var(--wb-border);background:var(--wb-surface2)}
+              .wb-auto-seg-btn{border:0;background:transparent;color:var(--wb-muted);padding:8px 12px;font:600 11px 'Space Grotesk',sans-serif;cursor:pointer}
+              .wb-auto-seg-btn.active{background:#fff;color:#111}
+              .wb-auto-pct{display:inline-flex;align-items:center;gap:6px;margin-left:auto}
+              .wb-auto-pct input{width:72px;padding:7px 8px;border-radius:8px;border:1px solid var(--wb-border);background:var(--wb-surface2);color:#fff;font-size:12px}
+              .wb-auto-pct span{font-size:12px;color:var(--wb-muted);font-weight:600}
+              .wb-auto-hint{display:block;margin-top:4px;font-size:10px;font-weight:500;text-transform:none;letter-spacing:0;color:rgba(255,255,255,.35)}
+              .wb-auto-seed-row{display:flex;gap:6px;align-items:center}
+              .wb-auto-seed-row input{flex:1}
             `;
             document.documentElement.appendChild(style);
 

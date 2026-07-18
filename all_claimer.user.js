@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         All Claimer — V4 - Thrill game
+// @name         All Claimer — V4
 // @namespace    waggerbot
-// @version      4.2.1
+// @version      4.3.1
 // @description  WaggerBot — claim auto Shuffle, Stake et Thrill + jeux Originaux Thrill
 // @match        https://shuffle.com/*
 // @match        https://shuffle.bet/*
@@ -5937,6 +5937,8 @@
           const KENO_NUMBERS = 40;
           const KENO_RISK_PROFILES = ["Classic", "Low", "Medium", "High"];
           const DICE_HOUSE_EDGE = 1; // RTP 99%
+          const HIST_UI_LIMIT = 100;   // lignes visibles dans le panneau
+          const HIST_STORE_LIMIT = 150; // mémoire / storage (éviter quota GM)
           const ORIGINALS_GAMES = {
             keno: { product: "thrill-keno", slug: "thrill-keno" },
             dice: { product: "thrill-dice", slug: "thrill-dice" },
@@ -6052,15 +6054,15 @@
           }
           if (Array.isArray(config.kenoSpots)) state.keno.spots = config.kenoSpots.slice();
           if (Array.isArray(config.kenoHistory) && config.kenoHistory.length) {
-            state.keno.history = config.kenoHistory.slice(0, 200);
+            state.keno.history = config.kenoHistory.slice(0, HIST_STORE_LIMIT);
             state.keno.lastResult = state.keno.history[0] || null;
           }
           if (Array.isArray(config.diceHistory) && config.diceHistory.length) {
-            state.dice.history = config.diceHistory.slice(0, 200);
+            state.dice.history = config.diceHistory.slice(0, HIST_STORE_LIMIT);
             state.dice.lastResult = state.dice.history[0] || null;
           }
           if (Array.isArray(config.limboHistory) && config.limboHistory.length) {
-            state.limbo.history = config.limboHistory.slice(0, 200);
+            state.limbo.history = config.limboHistory.slice(0, HIST_STORE_LIMIT);
             state.limbo.lastResult = state.limbo.history[0] || null;
           }
           if (!config.kenoCurrency) {
@@ -6201,36 +6203,51 @@
           }
 
           function persistConfig() {
-            storage.set("thr_currency", config.currency);
-            storage.set("thr_poll_interval", String(config.pollIntervalMs / 1000));
-            storage.set("thr_sound", config.soundEnabled);
-            storage.set("thr_notify", config.notifyEnabled);
-            storage.set("thr_auto_claim", config.autoClaimEnabled);
-            storage.set("thr_claim_delay", String(config.claimDelayMs / 1000));
-            storage.set("thr_bulk_claim_count", String(config.bulkClaimCount));
-            storage.setJSON("thr_last_msg_ids", config.lastMessageIds);
-            storage.setJSON("thr_seen_codes", config.seenCodes);
-            storage.setJSON("thr_code_history", state.codes);
-            storage.set("thr_keno_stake", String(config.kenoStake));
-            storage.set("thr_keno_risk", config.kenoRisk);
-            storage.setJSON("thr_keno_spots", state.keno.spots);
-            storage.set("thr_keno_auto_count", String(config.kenoAutoCount));
-            storage.set("thr_keno_auto_delay", String(config.kenoAutoDelayMs));
-            storage.set("thr_keno_playout", String(config.kenoPlayoutMs));
-            storage.set("thr_keno_speed", config.kenoSpeed || "instant");
-            storage.setJSON("thr_keno_history", state.keno.history.slice(0, 200));
-            storage.set("thr_keno_currency", getKenoCurrency());
-            storage.set("thr_dice_mode", config.diceMode || "Under");
-            storage.set("thr_dice_target", String(config.diceTarget));
-            storage.set("thr_dice_mult", String(config.diceMult));
-            storage.setJSON("thr_dice_history", state.dice.history.slice(0, 200));
-            storage.set("thr_limbo_mult", String(config.limboMult));
-            storage.setJSON("thr_limbo_history", state.limbo.history.slice(0, 200));
-            storage.set("thr_active_original", state.activeOriginal || "keno");
-            storage.set("thr_player_token", state.playerToken || config.playerToken || "");
-            storage.setJSON("thr_player_tokens", state.playerTokens || {});
-            storage.set("thr_browser_session", state.browserSession || config.browserSession || "");
-            if (state.exchangeRate > 0) storage.set("thr_fx_rate", String(state.exchangeRate));
+            try {
+              storage.set("thr_currency", config.currency);
+              storage.set("thr_poll_interval", String(config.pollIntervalMs / 1000));
+              storage.set("thr_sound", config.soundEnabled);
+              storage.set("thr_notify", config.notifyEnabled);
+              storage.set("thr_auto_claim", config.autoClaimEnabled);
+              storage.set("thr_claim_delay", String(config.claimDelayMs / 1000));
+              storage.set("thr_bulk_claim_count", String(config.bulkClaimCount));
+              storage.setJSON("thr_last_msg_ids", config.lastMessageIds);
+              storage.setJSON("thr_seen_codes", config.seenCodes);
+              storage.setJSON("thr_code_history", state.codes);
+              storage.set("thr_keno_stake", String(config.kenoStake));
+              storage.set("thr_keno_risk", config.kenoRisk);
+              storage.setJSON("thr_keno_spots", state.keno.spots);
+              storage.set("thr_keno_auto_count", String(config.kenoAutoCount));
+              storage.set("thr_keno_auto_delay", String(config.kenoAutoDelayMs));
+              storage.set("thr_keno_playout", String(config.kenoPlayoutMs));
+              storage.set("thr_keno_speed", config.kenoSpeed || "instant");
+              storage.setJSON("thr_keno_history", state.keno.history.slice(0, HIST_STORE_LIMIT));
+              storage.set("thr_keno_currency", getKenoCurrency());
+              storage.set("thr_dice_mode", config.diceMode || "Under");
+              storage.set("thr_dice_target", String(config.diceTarget));
+              storage.set("thr_dice_mult", String(config.diceMult));
+              storage.setJSON("thr_dice_history", state.dice.history.slice(0, HIST_STORE_LIMIT));
+              storage.set("thr_limbo_mult", String(config.limboMult));
+              storage.setJSON("thr_limbo_history", state.limbo.history.slice(0, HIST_STORE_LIMIT));
+              storage.set("thr_active_original", state.activeOriginal || "keno");
+              storage.set("thr_player_token", state.playerToken || config.playerToken || "");
+              storage.setJSON("thr_player_tokens", state.playerTokens || {});
+              storage.set("thr_browser_session", state.browserSession || config.browserSession || "");
+              if (state.exchangeRate > 0) storage.set("thr_fx_rate", String(state.exchangeRate));
+            } catch (err) {
+              log("persistConfig échoué (auto continue):", err && err.message);
+            }
+          }
+
+          function prependHistRow(histBoxId, rowEl) {
+            const histBox = document.getElementById(histBoxId);
+            if (!histBox || !rowEl) return;
+            const empty = histBox.querySelector(".wb-empty");
+            if (empty) empty.remove();
+            histBox.insertBefore(rowEl, histBox.firstChild);
+            while (histBox.children.length > HIST_UI_LIMIT) histBox.removeChild(histBox.lastChild);
+            // Garder le haut (dernier bet) visible
+            try { histBox.scrollTop = 0; } catch {}
           }
           // --- Logging / UI helpers --------------------------------------------------
 
@@ -7680,14 +7697,13 @@
                 "x" + r.mult + " · " + r.hitCount + " hits · " +
                 sign + formatKenoAmt(r.profit) + " " + (r.currency || getKenoCurrency());
             }
-            const statsBox = document.getElementById("wb-keno-stats");
-            if (statsBox) statsBox.innerHTML = renderKenoStatsHtml(computeKenoStats());
-            const histBox = document.getElementById("wb-keno-hist");
-            if (histBox && state.keno.history.length) {
-              const empty = histBox.querySelector(".wb-empty");
-              if (empty) empty.remove();
-              histBox.insertBefore(buildKenoHistRow(state.keno.history[0]), histBox.firstChild);
-              while (histBox.children.length > 30) histBox.removeChild(histBox.lastChild);
+            // Stats allégées en auto, mais hist à CHAQUE spin
+            if (!total || i === total || i % 5 === 0) {
+              const statsBox = document.getElementById("wb-keno-stats");
+              if (statsBox) statsBox.innerHTML = renderKenoStatsHtml(computeKenoStats());
+            }
+            if (state.keno.history.length) {
+              prependHistRow("wb-keno-hist", buildKenoHistRow(state.keno.history[0]));
             }
           }
 
@@ -7750,7 +7766,7 @@
           function pushKenoHistory(summary, opts) {
             state.keno.lastResult = summary;
             state.keno.history.unshift(summary);
-            if (state.keno.history.length > 200) state.keno.history.length = 200;
+            if (state.keno.history.length > HIST_STORE_LIMIT) state.keno.history.length = HIST_STORE_LIMIT;
             if (!opts || opts.persist !== false) persistConfig();
           }
 
@@ -7878,7 +7894,7 @@
                 pnl += r.profit || 0;
                 setStatus("Keno " + (i + 1) + "/" + count + " · x" + r.mult + " · " + r.hitCount + " hits", { quiet: true });
                 updateKenoLiveResult(r, i + 1, count);
-                if ((i + 1) % 15 === 0) persistConfig();
+                if ((i + 1) % 25 === 0) persistConfig();
               } catch (err) {
                 toast("Keno: " + err.message, "error");
                 state.keno.autoRunning = false;
@@ -7942,7 +7958,7 @@
               return `<button type="button" class="${cls}" data-n="${n}">${n}</button>`;
             }).join("");
 
-            const histRows = state.keno.history.slice(0, 30).map(h => {
+            const histRows = state.keno.history.slice(0, HIST_UI_LIMIT).map(h => {
               const profit = Number(h.profit) || 0;
               const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
               const cur = h.currency || kenoCur;
@@ -8236,7 +8252,7 @@
           function pushDiceHistory(summary, opts) {
             state.dice.lastResult = summary;
             state.dice.history.unshift(summary);
-            if (state.dice.history.length > 200) state.dice.history.length = 200;
+            if (state.dice.history.length > HIST_STORE_LIMIT) state.dice.history.length = HIST_STORE_LIMIT;
             if (!opts || opts.persist !== false) persistConfig();
           }
 
@@ -8289,30 +8305,24 @@
                 "roll " + (r.result != null ? r.result : "?") + " · x" + r.mult + " · " +
                 sign + formatKenoAmt(r.profit) + " " + (r.currency || getKenoCurrency());
             }
-            // Stats / hist seulement tous les 3 spins en auto (moins de DOM)
-            const refreshHeavy = !total || i === total || i % 3 === 0;
-            if (refreshHeavy) {
+            if (!total || i === total || i % 5 === 0) {
               const statsBox = document.getElementById("wb-dice-stats");
               if (statsBox) statsBox.innerHTML = renderDiceStatsHtml(computeDiceStats());
-              const histBox = document.getElementById("wb-dice-hist");
-              if (histBox && state.dice.history.length) {
-                const empty = histBox.querySelector(".wb-empty");
-                if (empty) empty.remove();
-                const h = state.dice.history[0];
-                const profit = Number(h.profit) || 0;
-                const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
-                const row = document.createElement("div");
-                row.className = "wb-keno-hist " + cls;
-                row.innerHTML = `
-                  <div class="wb-keno-hist-top">
-                    <span>${h.mode || "Under"} ${h.target} · roll ${h.result} · x${h.mult}</span>
-                    <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || getKenoCurrency()}</span>
-                  </div>
-                  <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
-                `;
-                histBox.insertBefore(row, histBox.firstChild);
-                while (histBox.children.length > 30) histBox.removeChild(histBox.lastChild);
-              }
+            }
+            if (state.dice.history.length) {
+              const h = state.dice.history[0];
+              const profit = Number(h.profit) || 0;
+              const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
+              const row = document.createElement("div");
+              row.className = "wb-keno-hist " + cls;
+              row.innerHTML = `
+                <div class="wb-keno-hist-top">
+                  <span>${h.mode || "Under"} ${h.target} · roll ${h.result} · x${h.mult}</span>
+                  <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || getKenoCurrency()}</span>
+                </div>
+                <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
+              `;
+              prependHistRow("wb-dice-hist", row);
             }
           }
 
@@ -8397,7 +8407,7 @@
                 pnl += r.profit || 0;
                 setStatus("Dice " + (i + 1) + "/" + count + " · " + r.result + " · x" + r.mult, { quiet: true });
                 updateDiceLiveResult(r, i + 1, count);
-                if ((i + 1) % 15 === 0) persistConfig();
+                if ((i + 1) % 25 === 0) persistConfig();
               } catch (err) {
                 toast("Dice: " + err.message, "error");
                 state.dice.autoRunning = false;
@@ -8431,7 +8441,7 @@
             const stats = computeDiceStats();
             const last = state.dice.lastResult;
 
-            const histRows = state.dice.history.slice(0, 30).map(h => {
+            const histRows = state.dice.history.slice(0, HIST_UI_LIMIT).map(h => {
               const profit = Number(h.profit) || 0;
               const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
               return `<div class="wb-keno-hist ${cls}">
@@ -8620,7 +8630,7 @@
           function pushLimboHistory(summary, opts) {
             state.limbo.lastResult = summary;
             state.limbo.history.unshift(summary);
-            if (state.limbo.history.length > 200) state.limbo.history.length = 200;
+            if (state.limbo.history.length > HIST_STORE_LIMIT) state.limbo.history.length = HIST_STORE_LIMIT;
             if (!opts || opts.persist !== false) persistConfig();
           }
 
@@ -8673,29 +8683,24 @@
                 "result " + (r.result != null ? r.result : "?") + " · cible x" + r.target + " · " +
                 sign + formatKenoAmt(r.profit) + " " + (r.currency || getKenoCurrency());
             }
-            const refreshHeavy = !total || i === total || i % 3 === 0;
-            if (refreshHeavy) {
+            if (!total || i === total || i % 5 === 0) {
               const statsBox = document.getElementById("wb-limbo-stats");
               if (statsBox) statsBox.innerHTML = renderLimboStatsHtml(computeLimboStats());
-              const histBox = document.getElementById("wb-limbo-hist");
-              if (histBox && state.limbo.history.length) {
-                const empty = histBox.querySelector(".wb-empty");
-                if (empty) empty.remove();
-                const h = state.limbo.history[0];
-                const profit = Number(h.profit) || 0;
-                const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
-                const row = document.createElement("div");
-                row.className = "wb-keno-hist " + cls;
-                row.innerHTML = `
-                  <div class="wb-keno-hist-top">
-                    <span>x${h.target} · result ${h.result} · win x${h.mult}</span>
-                    <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || getKenoCurrency()}</span>
-                  </div>
-                  <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
-                `;
-                histBox.insertBefore(row, histBox.firstChild);
-                while (histBox.children.length > 30) histBox.removeChild(histBox.lastChild);
-              }
+            }
+            if (state.limbo.history.length) {
+              const h = state.limbo.history[0];
+              const profit = Number(h.profit) || 0;
+              const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
+              const row = document.createElement("div");
+              row.className = "wb-keno-hist " + cls;
+              row.innerHTML = `
+                <div class="wb-keno-hist-top">
+                  <span>x${h.target} · result ${h.result} · win x${h.mult}</span>
+                  <span class="pnl">${profit >= 0 ? "+" : ""}${formatKenoAmt(profit)} ${h.currency || getKenoCurrency()}</span>
+                </div>
+                <div class="wb-keno-hist-meta">mise ${formatKenoAmt(h.stake)} · ${formatKenoTime(h.ts)}</div>
+              `;
+              prependHistRow("wb-limbo-hist", row);
             }
           }
 
@@ -8776,7 +8781,7 @@
                 pnl += r.profit || 0;
                 setStatus("Limbo " + (i + 1) + "/" + count + " · " + r.result + " · x" + r.target, { quiet: true });
                 updateLimboLiveResult(r, i + 1, count);
-                if ((i + 1) % 15 === 0) persistConfig();
+                if ((i + 1) % 25 === 0) persistConfig();
               } catch (err) {
                 toast("Limbo: " + err.message, "error");
                 state.limbo.autoRunning = false;
@@ -8805,7 +8810,7 @@
             const stats = computeLimboStats();
             const last = state.limbo.lastResult;
 
-            const histRows = state.limbo.history.slice(0, 30).map(h => {
+            const histRows = state.limbo.history.slice(0, HIST_UI_LIMIT).map(h => {
               const profit = Number(h.profit) || 0;
               const cls = profit > 0 ? "ok" : (profit < 0 ? "err" : "");
               return `<div class="wb-keno-hist ${cls}">
@@ -9243,7 +9248,7 @@
               .wb-keno-stat .v{font:600 13px 'JetBrains Mono',monospace;color:#fff}
               .wb-keno-stat.ok .v{color:var(--wb-green)}
               .wb-keno-stat.err .v{color:var(--wb-red)}
-              .wb-keno-hist-list{display:flex;flex-direction:column;gap:4px;max-height:280px;overflow:auto}
+              .wb-keno-hist-list{display:flex;flex-direction:column;gap:4px;max-height:420px;overflow:auto;scroll-behavior:smooth}
               .wb-keno-hist{padding:8px 10px;border-radius:8px;background:var(--wb-surface);border:1px solid rgba(255,255,255,.04);font:500 11px 'JetBrains Mono',monospace;color:var(--wb-muted)}
               .wb-keno-hist-top{display:flex;justify-content:space-between;gap:8px;color:#d8cce8}
               .wb-keno-hist-meta{margin-top:4px;font-size:10px;opacity:.75}
